@@ -21,7 +21,7 @@ func setupSecureServer(securityCfg *config.Config) *gin.Engine {
 	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{})
 	searcher := &testMockSearcher{}
 
-	s := New(securityCfg, pipeline, chatSvc, searcher, emb)
+	s := New(securityCfg, pipeline, chatSvc, searcher, emb, nil, nil)
 	return s.Setup()
 }
 

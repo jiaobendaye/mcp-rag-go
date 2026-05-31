@@ -106,7 +106,7 @@ func setupTestServer() *gin.Engine {
 	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{})
 	searcher := &testMockSearcher{}
 
-	s := New(cfg, pipeline, chatSvc, searcher, emb)
+	s := New(cfg, pipeline, chatSvc, searcher, emb, nil, nil)
 	return s.Setup()
 }
 

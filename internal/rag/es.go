@@ -433,3 +433,210 @@ func (e *ES8Indexer) doSearch(ctx context.Context, req map[string]any) ([]Search
 }
 
 const timeFormat = "2006-01-02T15:04:05Z07:00"
+
+// ListDocuments returns paginated documents from an index using ES aggregation.
+func (e *ES8Indexer) ListDocuments(indexName string, limit, offset int) (*DocumentList, error) {
+	return e.listDocuments(indexName, limit, offset, nil)
+}
+
+func (e *ES8Indexer) listDocuments(indexName string, limit, offset int, filename *string) (*DocumentList, error) {
+	ctx := context.Background()
+	req := map[string]any{"size": 0, "aggs": map[string]any{
+		"by_doc": map[string]any{
+			"terms": map[string]any{"field": "document_id", "size": limit + offset},
+			"aggs": map[string]any{
+				"sample":      map[string]any{"top_hits": map[string]any{"size": 1, "_source": []string{"content", "document_id", "source", "filename", "file_type", "chunk_index", "processed_at", "chunk_char_count"}}},
+				"chunk_count": map[string]any{"value_count": map[string]string{"field": "chunk_index"}},
+			},
+		},
+	}}
+	body, _ := json.Marshal(req)
+	res, err := e.client.Search(e.client.Search.WithContext(ctx), e.client.Search.WithIndex(indexName), e.client.Search.WithBody(bytes.NewReader(body)))
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == 404 {
+		return &DocumentList{Total: 0, Documents: []DocInfo{}, Limit: limit, Offset: offset}, nil
+	}
+	if res.StatusCode >= 400 {
+		b, _ := io.ReadAll(res.Body)
+		return nil, fmt.Errorf("list documents: %s", string(b))
+	}
+	return parseDocList(res.Body, limit, offset)
+}
+
+func parseDocList(r io.Reader, limit, offset int) (*DocumentList, error) {
+	var aggResp struct {
+		Aggregations struct {
+			ByDoc struct {
+				Buckets []struct {
+					Key string `json:"key"`
+					Sample struct {
+						Hits struct {
+							Hits []struct {
+								Source struct {
+									Content        string `json:"content"`
+									DocumentID     string `json:"document_id"`
+									Source         string `json:"source"`
+									Filename       string `json:"filename"`
+									FileType       string `json:"file_type"`
+									ChunkIndex     int    `json:"chunk_index"`
+									ProcessedAt    string `json:"processed_at"`
+									ChunkCharCount int    `json:"chunk_char_count"`
+								} `json:"_source"`
+							} `json:"hits"`
+						} `json:"hits"`
+					} `json:"sample"`
+					ChunkCount struct{ Value int } `json:"chunk_count"`
+				} `json:"buckets"`
+			} `json:"by_doc"`
+		} `json:"aggregations"`
+	}
+	json.NewDecoder(r).Decode(&aggResp)
+	buckets := aggResp.Aggregations.ByDoc.Buckets
+	total := len(buckets)
+	var docs []DocInfo
+	for i := offset; i < total && i < offset+limit; i++ {
+		b := buckets[i]
+		if len(b.Sample.Hits.Hits) > 0 {
+			src := b.Sample.Hits.Hits[0].Source
+			docs = append(docs, DocInfo{
+				ID: src.DocumentID, Content: truncate(src.Content, 200),
+				Source: src.Source, Filename: src.Filename, FileType: src.FileType,
+				ChunkCount: b.ChunkCount.Value, ProcessedAt: src.ProcessedAt,
+			})
+		}
+	}
+	if docs == nil {
+		docs = []DocInfo{}
+	}
+	return &DocumentList{Total: total, Documents: docs, Limit: limit, Offset: offset}, nil
+}
+
+// DeleteDocument removes all chunks with the given document_id.
+func (e *ES8Indexer) DeleteDocument(indexName, documentID string) error {
+	req := map[string]any{"query": map[string]any{"term": map[string]any{"document_id": documentID}}}
+	body, _ := json.Marshal(req)
+	res, err := e.client.DeleteByQuery([]string{indexName}, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("delete document: %w", err)
+	}
+	res.Body.Close()
+	return nil
+}
+
+// ListFiles returns aggregated file information.
+func (e *ES8Indexer) ListFiles(indexName string) ([]FileInfo, error) {
+	ctx := context.Background()
+	req := map[string]any{"size": 0, "aggs": map[string]any{
+		"by_file": map[string]any{
+			"terms": map[string]any{"field": "filename", "size": 200},
+			"aggs": map[string]any{
+				"sample":      map[string]any{"top_hits": map[string]any{"size": 1, "_source": []string{"document_id", "source", "file_type", "processed_at"}}},
+				"chunk_count": map[string]any{"value_count": map[string]string{"field": "chunk_index"}},
+				"total_chars": map[string]any{"sum": map[string]string{"field": "chunk_char_count"}},
+			},
+		},
+	}}
+	body, _ := json.Marshal(req)
+	res, err := e.client.Search(e.client.Search.WithContext(ctx), e.client.Search.WithIndex(indexName), e.client.Search.WithBody(bytes.NewReader(body)))
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == 404 {
+		return []FileInfo{}, nil
+	}
+	if res.StatusCode >= 400 {
+		b, _ := io.ReadAll(res.Body)
+		return nil, fmt.Errorf("list files: %s", string(b))
+	}
+	var aggResp struct {
+		Aggregations struct {
+			ByFile struct {
+				Buckets []struct {
+					Key        string  `json:"key"`
+					ChunkCount struct{ Value int } `json:"chunk_count"`
+					TotalChars struct{ Value float64 } `json:"total_chars"`
+					Sample     struct {
+						Hits struct {
+							Hits []struct {
+								Source struct {
+									DocumentID  string `json:"document_id"`
+									Source      string `json:"source"`
+									FileType    string `json:"file_type"`
+									ProcessedAt string `json:"processed_at"`
+								} `json:"_source"`
+							} `json:"hits"`
+						} `json:"hits"`
+					} `json:"sample"`
+				} `json:"buckets"`
+			} `json:"by_file"`
+		} `json:"aggregations"`
+	}
+	json.NewDecoder(res.Body).Decode(&aggResp)
+	var files []FileInfo
+	for _, b := range aggResp.Aggregations.ByFile.Buckets {
+		fi := FileInfo{Filename: b.Key, ChunkCount: b.ChunkCount.Value, TotalChars: int(b.TotalChars.Value)}
+		if len(b.Sample.Hits.Hits) > 0 {
+			src := b.Sample.Hits.Hits[0].Source
+			fi.DocumentID, fi.Source, fi.FileType, fi.ProcessedAt = src.DocumentID, src.Source, src.FileType, src.ProcessedAt
+		}
+		files = append(files, fi)
+	}
+	if files == nil {
+		files = []FileInfo{}
+	}
+	return files, nil
+}
+
+// DeleteFile removes all chunks with the given filename.
+func (e *ES8Indexer) DeleteFile(indexName, filename string) error {
+	req := map[string]any{"query": map[string]any{"term": map[string]any{"filename": filename}}}
+	body, _ := json.Marshal(req)
+	res, err := e.client.DeleteByQuery([]string{indexName}, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("delete file: %w", err)
+	}
+	res.Body.Close()
+	return nil
+}
+
+// DocInfo is a summary of a document for listing.
+type DocInfo struct {
+	ID          string `json:"id"`
+	Content     string `json:"content"`
+	Source      string `json:"source"`
+	Filename    string `json:"filename"`
+	FileType    string `json:"file_type"`
+	ChunkCount  int    `json:"chunk_count"`
+	ProcessedAt string `json:"processed_at"`
+}
+
+// DocumentList is the response for list-documents.
+type DocumentList struct {
+	Total     int       `json:"total"`
+	Documents []DocInfo `json:"documents"`
+	Limit     int       `json:"limit"`
+	Offset    int       `json:"offset"`
+}
+
+// FileInfo is the response for list-files.
+type FileInfo struct {
+	Filename    string `json:"filename"`
+	Source      string `json:"source"`
+	FileType    string `json:"file_type"`
+	ChunkCount  int    `json:"chunk_count"`
+	TotalChars  int    `json:"total_chars"`
+	DocumentID  string `json:"document_id"`
+	ProcessedAt string `json:"processed_at"`
+}
+
+func truncate(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "..."
+}

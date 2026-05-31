@@ -17,7 +17,10 @@ type Config struct {
 
 	// Elasticsearch
 	ESUrl    string `yaml:"es_url"`    // ES connection URL
-	ESIndex  string `yaml:"es_index"`  // ES index name for single KB MVP
+	ESIndex  string `yaml:"es_index"`  // ES index name (legacy, for single KB)
+
+	// Knowledge Base
+	KnowledgeBaseDBPath string `yaml:"knowledge_base_db_path"`
 
 	// Embedding
 	EmbeddingProvider string `yaml:"embedding_provider"` // "openai" | "ark" | "ollama"
@@ -64,6 +67,7 @@ func DefaultConfig() *Config {
 		HTTPPort:          8060,
 		ESUrl:             "http://localhost:9200",
 		ESIndex:           "kb_1",
+		KnowledgeBaseDBPath: "./data/knowledge_bases.sqlite3",
 		EmbeddingProvider: "openai",
 		EmbeddingModel:    "text-embedding-3-small",
 		LLMProvider:       "openai",

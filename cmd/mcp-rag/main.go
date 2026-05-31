@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
+	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
 	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
 	"github.com/jiaobendaye/mcp-rag-go/internal/server"
 )
@@ -75,8 +76,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 		res.Body.Close()
 	}
 
-	// 3. Create ES indexer and ensure index exists
-	esIndexer := rag.NewES8Indexer(esClient, cfg.ESIndex)
+	// 3. Create knowledge base service
+	kbService, err := knowledgebase.NewService(cfg.KnowledgeBaseDBPath)
+	if err != nil {
+		return fmt.Errorf("create kb service: %w", err)
+	}
+	defaultKB, err := kbService.EnsurePublicDefault()
+	if err != nil {
+		return fmt.Errorf("ensure default kb: %w", err)
+	}
+	log.Printf("Default knowledge base: %s (index: %s)", defaultKB.Name, defaultKB.IndexName())
+
+	// 4. Create ES indexer
+	esIndexer := rag.NewES8Indexer(esClient, defaultKB.IndexName())
 
 	// Probe embedding dimensions
 	dims, err := probeEmbeddingDims(ctx, cfg)
@@ -89,7 +101,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ensure index: %w", err)
 	}
 
-	// 4. Create embedder
+	// 5. Create embedder
 	embedder := &openAIEmbedder{
 		baseURL:  cfg.EmbeddingBaseURL,
 		apiKey:   cfg.EmbeddingAPIKey,
@@ -110,7 +122,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// 7. Setup HTTP server
 	gin.SetMode(gin.ReleaseMode)
-	srv := server.New(cfg, pipeline, chatSvc, esIndexer, embedder)
+	srv := server.New(cfg, pipeline, chatSvc, esIndexer, embedder, kbService, esIndexer)
 	router := srv.Setup()
 
 	// 8. Start server
