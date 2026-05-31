@@ -9,6 +9,8 @@ import (
 	"log"
 	"sort"
 
+	"github.com/cloudwego/eino/components/indexer"
+	"github.com/cloudwego/eino/schema"
 	"github.com/elastic/go-elasticsearch/v8"
 )
 
@@ -160,6 +162,57 @@ func (e *ES8Indexer) IndexChunks(ctx context.Context, chunks []Chunk, vectors []
 	}
 
 	return nil
+}
+
+// Store implements eino indexer.Indexer. It extracts chunks and vectors from eino Documents.
+func (e *ES8Indexer) Store(ctx context.Context, docs []*schema.Document, opts ...indexer.Option) ([]string, error) {
+	chunks := make([]Chunk, 0, len(docs))
+	vectors := make([][]float32, 0, len(docs))
+	ids := make([]string, 0, len(docs))
+
+	for i, doc := range docs {
+		// Extract vector from metadata (set by Embedder node)
+		var vec []float32
+		if v, ok := doc.MetaData["_embedding"]; ok {
+			switch vv := v.(type) {
+			case []float64:
+				vec = make([]float32, len(vv))
+				for j, f := range vv {
+					vec[j] = float32(f)
+				}
+			case []float32:
+				vec = vv
+			}
+		}
+
+		chunk := Chunk{
+			ID:          fmt.Sprintf("%s_chunk_%04d", doc.ID, i),
+			DocumentID:  doc.ID,
+			ChunkIndex:  i,
+			TotalChunks: len(docs),
+			Source:      stringMeta(doc.MetaData, "source", doc.ID),
+			Filename:    stringMeta(doc.MetaData, "filename", "unknown"),
+			FileType:    stringMeta(doc.MetaData, "file_type", "text"),
+			Content:     doc.Content,
+		}
+		chunks = append(chunks, chunk)
+		vectors = append(vectors, vec)
+		ids = append(ids, chunk.ID)
+	}
+
+	if err := e.IndexChunks(ctx, chunks, vectors); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func stringMeta(m map[string]any, key, defaultVal string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return defaultVal
 }
 
 // Search performs KNN vector search on the content_vector field (backward compat).

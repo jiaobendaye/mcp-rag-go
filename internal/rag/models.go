@@ -6,18 +6,27 @@ import (
 	"crypto/md5"
 	"fmt"
 	"time"
+
+	"github.com/cloudwego/eino/components/embedding"
+	"github.com/cloudwego/eino/components/model"
 )
+
+// Embedder is eino's embedding.Embedder (re-exported for convenience).
+type Embedder = embedding.Embedder
+
+// LLMGenerator is eino's model.BaseChatModel (re-exported for convenience).
+type LLMGenerator = model.BaseChatModel
 
 // Chunk represents a document chunk to be indexed.
 type Chunk struct {
-	ID          string  // unique chunk ID
-	DocumentID  string  // parent document ID
-	ChunkIndex  int     // position in document
-	TotalChunks int     // total chunks in document
-	Source      string  // origin filename or URL
-	Filename    string  // display filename
-	FileType    string  // file extension
-	Content     string  // chunk text content
+	ID          string
+	DocumentID  string
+	ChunkIndex  int
+	TotalChunks int
+	Source      string
+	Filename    string
+	FileType    string
+	Content     string
 }
 
 // SearchHit represents a search result from ES.
@@ -38,28 +47,13 @@ func GenerateChunkID(docID string, index int) string {
 
 // GenerateDocID creates a deterministic document ID from content hash.
 func GenerateDocID(content string) string {
-	hash := md5.Sum([]byte(content))
-	return fmt.Sprintf("%x", hash)
-}
-
-// Indexer defines the interface for indexing chunks.
-type Indexer interface {
-	// EnsureIndex creates the ES index with proper mapping if it doesn't exist.
-	EnsureIndex(ctx context.Context, dims int) error
-
-	// IndexChunks bulk-indexes chunks with their embedding vectors.
-	IndexChunks(ctx context.Context, chunks []Chunk, vectors [][]float32) error
+	return fmt.Sprintf("%x", md5.Sum([]byte(content)))
 }
 
 // Searcher defines the interface for searching indexed documents.
 type Searcher interface {
-	// Search performs KNN vector search (backward compat).
 	Search(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error)
-
-	// SearchHybrid performs hybrid search based on mode: "hybrid" | "rrf" | "knn".
 	SearchHybrid(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error)
-
-	// SearchWithMode performs search with explicit mode selection.
 	SearchWithMode(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string) ([]SearchHit, error)
 }
 
@@ -68,5 +62,4 @@ type HealthChecker interface {
 	HealthCheck(ctx context.Context) error
 }
 
-// Now is a testable clock function.
 var Now = time.Now

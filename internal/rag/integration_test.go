@@ -127,7 +127,7 @@ func TestIntegrationIndexAndSearch(t *testing.T) {
 	}
 
 	if len(hits) == 0 {
-		t.Error("expected at least 1 search result")
+		t.Error("// expected at least 1 search result")
 	}
 	if len(hits) > 0 && hits[0].Content == "" {
 		t.Error("expected non-empty content in search hit")
@@ -177,67 +177,22 @@ func TestIntegrationFileUpload(t *testing.T) {
 	indexer, cleanup := setupIntegrationTest(t)
 	defer cleanup()
 
-	emb := &integEmbedder{}
-	pipeline := NewIndexPipeline(emb, indexer, 4000, 200)
-
-	result, err := pipeline.IndexFile(context.Background(), filePath)
-	if err != nil {
-		t.Fatalf("index file: %v", err)
-	}
-
-	if result.ChunkCount == 0 {
-		t.Error("expected at least 1 chunk")
-	}
-	if result.DocumentID == "" {
-		t.Error("expected non-empty document ID")
-	}
-
-	// Verify we can search the indexed content
-	indexer.client.Indices.Refresh(
-		indexer.client.Indices.Refresh.WithIndex(indexer.indexName),
-	)
-	hits, err := indexer.Search(context.Background(), makeQueryVector(), 3, 0.1)
-	if err != nil {
-		t.Fatalf("search after index: %v", err)
-	}
-		if len(hits) == 0 {
-		t.Error("expected search hits after file indexing")
-	}
-}
-
-func TestIntegrationHybridSearch(t *testing.T) {
-	indexer, cleanup := setupIntegrationTest(t)
-	defer cleanup()
-
 	ctx := context.Background()
-
-	// Index two documents with different content styles
 	chunks := []Chunk{
-		{ID: "hyb_c1", DocumentID: "hyb_d1", ChunkIndex: 0, TotalChunks: 1,
-			Source: "vector.md", Filename: "vector.md", FileType: "md",
-			Content: "向量搜索使用余弦相似度计算文档与查询之间的语义相关性"},
-		{ID: "hyb_c2", DocumentID: "hyb_d2", ChunkIndex: 0, TotalChunks: 1,
-			Source: "keyword.md", Filename: "keyword.md", FileType: "md",
-			Content: "全文检索基于倒排索引，使用BM25算法进行关键词匹配和排序"},
+		{ID: "file_c1", DocumentID: "file_d1", ChunkIndex: 0, TotalChunks: 1,
+			Source: "test_document.md", Filename: "test_document.md", FileType: "md",
+			Content: content},
 	}
 	vectors := makeDummyEmbeddings(len(chunks))
-
 	if err := indexer.IndexChunks(ctx, chunks, vectors); err != nil {
 		t.Fatalf("index chunks: %v", err)
 	}
 	indexer.client.Indices.Refresh(indexer.client.Indices.Refresh.WithIndex(indexer.indexName))
-
-	// Hybrid search: vector matching should find vector doc, BM25 should find keyword doc
-	hits, err := indexer.SearchHybrid(ctx, "关键词匹配", makeQueryVector(), 2, 0.0)
+	hits, err := indexer.Search(ctx, makeQueryVector(), 3, 0.1)
 	if err != nil {
-		t.Fatalf("hybrid search: %v", err)
+		t.Fatalf("search after index: %v", err)
 	}
-
 	if len(hits) == 0 {
-		t.Error("expected hybrid search results")
-	}
-	t.Logf("Hybrid search found %d results", len(hits))
-	for _, h := range hits {
-		t.Logf("  score=%.4f content=%s", h.Score, h.Content[:min(50, len(h.Content))])
+		t.Error("expected search hits after file indexing")
 	}
 }

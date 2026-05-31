@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/cloudwego/eino/components/document"
+	"github.com/cloudwego/eino/compose"
 	"github.com/gin-gonic/gin"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
@@ -18,25 +20,25 @@ import (
 
 // Server holds all dependencies for HTTP handlers.
 type Server struct {
-	cfg       *config.Config
-	pipeline  *rag.IndexPipeline
-	chatSvc   *rag.ChatService
-	searcher  rag.Searcher
-	embedder  rag.Embedder
-	kbs       *knowledgebase.Service
-	esIndexer *rag.ES8Indexer
+	cfg        *config.Config
+	chain compose.Runnable[document.Source, []string]
+	chatSvc    *rag.ChatService
+	searcher   rag.Searcher
+	embedder   rag.Embedder
+	kbs        *knowledgebase.Service
+	esIndexer  *rag.ES8Indexer
 }
 
 // New creates a new Server with all dependencies.
-func New(cfg *config.Config, pipeline *rag.IndexPipeline, chatSvc *rag.ChatService, searcher rag.Searcher, embedder rag.Embedder, kbs *knowledgebase.Service, esIndexer *rag.ES8Indexer) *Server {
+func New(cfg *config.Config, chain compose.Runnable[document.Source, []string], chatSvc *rag.ChatService, searcher rag.Searcher, embedder rag.Embedder, kbs *knowledgebase.Service, esIndexer *rag.ES8Indexer) *Server {
 	return &Server{
-		cfg:       cfg,
-		pipeline:  pipeline,
-		chatSvc:   chatSvc,
-		searcher:  searcher,
-		embedder:  embedder,
-		kbs:       kbs,
-		esIndexer: esIndexer,
+		cfg:        cfg,
+		chain:      chain,
+		chatSvc:    chatSvc,
+		searcher:   searcher,
+		embedder:   embedder,
+		kbs:        kbs,
+		esIndexer:  esIndexer,
 	}
 }
 
@@ -269,17 +271,40 @@ func (s *Server) addDocument(c *gin.Context) {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": d.Reason})
 			return
 		}
-		result, err := s.pipeline.IndexText(c.Request.Context(), req.Content, "manual_input")
+		// Write content to temp file for Chain
+	if s.chain == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "index chain not configured"})
+		return
+	}
+	tmpFile, err := os.CreateTemp("", "mcp-rag-doc-*.txt")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmpFile.WriteString(req.Content); err != nil {
+		tmpFile.Close()
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	tmpFile.Close()
 
+	ids, err := s.chain.Invoke(c.Request.Context(), document.Source{URI: tmpPath})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
 
+	docID := ""
+	if len(ids) > 0 {
+		docID = ids[0] // Use first chunk ID as document reference
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":     "Document added successfully",
-		"document_id": result.DocumentID,
-		"chunk_count": result.ChunkCount,
+		"document_id": docID,
+		"chunk_count": len(ids),
 	})
 }
 
@@ -334,29 +359,15 @@ func (s *Server) uploadFiles(c *gin.Context) {
 			continue
 		}
 
-		// Index the file
-		result, err := s.pipeline.IndexFile(c.Request.Context(), tmpPath)
+		// Index via Chain
+		_, err = s.chain.Invoke(c.Request.Context(), document.Source{URI: tmpPath})
+		os.Remove(tmpPath)
 		if err != nil {
-			results = append(results, fileResult{
-				Filename:      fh.Filename,
-				ContentLength: fh.Size,
-				Error:         err.Error(),
-			})
+			results = append(results, fileResult{Filename: fh.Filename, ContentLength: fh.Size, Error: err.Error()})
 			continue
 		}
-
 		successful++
-		results = append(results, fileResult{
-			Filename:      fh.Filename,
-			ContentLength: fh.Size,
-			Processed:     true,
-		})
-
-		// Cleanup temp file
-		os.Remove(tmpPath)
-
-		// Result is unused but confirms successful indexing
-		_ = result
+		results = append(results, fileResult{Filename: fh.Filename, ContentLength: fh.Size, Processed: true})
 	}
 
 	c.JSON(http.StatusOK, gin.H{

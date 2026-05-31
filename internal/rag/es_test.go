@@ -4,7 +4,25 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/cloudwego/eino/components/embedding"
 )
+
+// mockEmbedder implements eino embedding.Embedder for testing.
+type mockEmbedder struct {
+	embedFunc func(ctx context.Context, texts []string, opts ...embedding.Option) ([][]float64, error)
+}
+
+func (m *mockEmbedder) EmbedStrings(ctx context.Context, texts []string, opts ...embedding.Option) ([][]float64, error) {
+	if m.embedFunc != nil {
+		return m.embedFunc(ctx, texts, opts...)
+	}
+	vecs := make([][]float64, len(texts))
+	for i := range vecs {
+		vecs[i] = []float64{0.1, 0.2, 0.3}
+	}
+	return vecs, nil
+}
 
 // mockIndexer implements Indexer for testing.
 type mockIndexer struct {
