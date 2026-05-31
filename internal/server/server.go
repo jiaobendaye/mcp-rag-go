@@ -176,8 +176,8 @@ func (s *Server) search(c *gin.Context) {
 		return
 	}
 
-	// Search
-	hits, err := s.searcher.Search(c.Request.Context(), toFloat32(vecs[0]), limit, s.cfg.MinScore)
+	// Search with configured mode (hybrid/rrf/knn)
+	hits, err := s.searcher.SearchWithMode(c.Request.Context(), query, toFloat32(vecs[0]), limit, s.cfg.MinScore, s.cfg.SearchMode)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return

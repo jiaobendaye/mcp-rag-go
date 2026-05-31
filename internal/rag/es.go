@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 
 	"github.com/elastic/go-elasticsearch/v8"
 )
@@ -161,13 +162,42 @@ func (e *ES8Indexer) IndexChunks(ctx context.Context, chunks []Chunk, vectors []
 	return nil
 }
 
-// Search performs KNN vector search on the content_vector field.
+// Search performs KNN vector search on the content_vector field (backward compat).
 func (e *ES8Indexer) Search(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
+	return e.searchKNN(ctx, queryVector, topK, minScore)
+}
+
+// SearchHybrid performs hybrid search based on mode:
+//
+//	"hybrid": KNN + BM25 manual fusion (default, works on free license)
+//	"rrf":    ES native RRF fusion (requires paid license)
+//	"knn":    pure KNN vector search
+func (e *ES8Indexer) SearchHybrid(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
+	return e.searchWithMode(ctx, query, queryVector, topK, minScore, "hybrid")
+}
+
+// SearchWithMode performs search with explicit mode selection.
+func (e *ES8Indexer) SearchWithMode(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string) ([]SearchHit, error) {
+	return e.searchWithMode(ctx, query, queryVector, topK, minScore, mode)
+}
+
+func (e *ES8Indexer) searchWithMode(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string) ([]SearchHit, error) {
+	switch mode {
+	case "knn":
+		return e.searchKNN(ctx, queryVector, topK, minScore)
+	case "rrf":
+		return e.searchRRF(ctx, query, queryVector, topK, minScore)
+	default: // "hybrid"
+		return e.searchManualFusion(ctx, query, queryVector, topK, minScore)
+	}
+}
+
+// searchKNN performs pure KNN vector search.
+func (e *ES8Indexer) searchKNN(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
 	numCandidates := topK * 10
 	if numCandidates < 50 {
 		numCandidates = 50
 	}
-
 	req := map[string]any{
 		"knn": []map[string]any{{
 			"field":          "content_vector",
@@ -177,11 +207,175 @@ func (e *ES8Indexer) Search(ctx context.Context, queryVector []float32, topK int
 		}},
 		"size": topK,
 	}
-
 	if minScore > 0 {
 		req["min_score"] = minScore
 	}
+	return e.doSearch(ctx, req)
+}
 
+// searchRRF performs ES native KNN + BM25 + RRF fusion (requires paid license).
+func (e *ES8Indexer) searchRRF(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
+	numCandidates := topK * 10
+	if numCandidates < 50 {
+		numCandidates = 50
+	}
+	req := map[string]any{
+		"knn": []map[string]any{{
+			"field":          "content_vector",
+			"query_vector":   queryVector,
+			"k":              topK,
+			"num_candidates": numCandidates,
+		}},
+		"query": map[string]any{
+			"bool": map[string]any{
+				"must": []map[string]any{
+					{"match": map[string]any{"content": query}},
+				},
+			},
+		},
+		"rank": map[string]any{
+			"rrf": map[string]any{
+				"rank_constant":   60,
+				"rank_window_size": 100,
+			},
+		},
+		"size": topK,
+	}
+	if minScore > 0 {
+		req["min_score"] = minScore
+	}
+	return e.doSearch(ctx, req)
+}
+
+// searchBM25 performs pure BM25 full-text search.
+func (e *ES8Indexer) searchBM25(ctx context.Context, query string, topK int, minScore float64) ([]SearchHit, error) {
+	req := map[string]any{
+		"query": map[string]any{
+			"match": map[string]any{
+				"content": query,
+			},
+		},
+		"size": topK,
+	}
+	if minScore > 0 {
+		req["min_score"] = minScore
+	}
+	return e.doSearch(ctx, req)
+}
+
+// searchManualFusion performs KNN + BM25 with client-side RRF-like fusion.
+func (e *ES8Indexer) searchManualFusion(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
+	candidateK := topK * 2
+	if candidateK < 10 {
+		candidateK = 10
+	}
+
+	// Run KNN and BM25 in parallel
+	type result struct {
+		hits []SearchHit
+		err  error
+	}
+	knnCh := make(chan result, 1)
+	bm25Ch := make(chan result, 1)
+
+	go func() {
+		h, err := e.searchKNN(ctx, queryVector, candidateK, 0)
+		knnCh <- result{h, err}
+	}()
+	go func() {
+		h, err := e.searchBM25(ctx, query, candidateK, 0)
+		bm25Ch <- result{h, err}
+	}()
+
+	knnRes := <-knnCh
+	bm25Res := <-bm25Ch
+
+	if knnRes.err != nil {
+		return nil, fmt.Errorf("knn search: %w", knnRes.err)
+	}
+	if bm25Res.err != nil {
+		return nil, fmt.Errorf("bm25 search: %w", bm25Res.err)
+	}
+
+	return fuseResults(knnRes.hits, bm25Res.hits, topK, minScore), nil
+}
+
+// fuseResults merges KNN and BM25 results using RRF-like reciprocal rank fusion.
+func fuseResults(knnHits, bm25Hits []SearchHit, topK int, minScore float64) []SearchHit {
+	const (
+		vectorWeight  = 0.7
+		keywordWeight = 0.3
+		fusionK       = 60.0
+	)
+
+	// Track best score per chunk_id
+	type candidate struct {
+		hit          *SearchHit
+		vectorScore  float64
+		keywordScore float64
+		vectorRank   int
+		keywordRank  int
+	}
+
+	candidates := make(map[string]*candidate)
+
+	// Process KNN results
+	for i, h := range knnHits {
+		c := &candidate{hit: &h, vectorScore: h.Score, vectorRank: i + 1}
+		candidates[h.ChunkID] = c
+	}
+
+	// Process BM25 results
+	for i, h := range bm25Hits {
+		c, exists := candidates[h.ChunkID]
+		if !exists {
+			c = &candidate{hit: &h}
+			candidates[h.ChunkID] = c
+		}
+		c.keywordScore = h.Score
+		c.keywordRank = i + 1
+	}
+
+	// Calculate fused scores
+	type scored struct {
+		hit   *SearchHit
+		score float64
+	}
+	var ranked []scored
+	for _, c := range candidates {
+		score := 0.0
+		if c.vectorRank > 0 {
+			score += vectorWeight * (1.0 / (fusionK + float64(c.vectorRank)))
+			score += vectorWeight * 0.05 * c.vectorScore
+		}
+		if c.keywordRank > 0 {
+			score += keywordWeight * (1.0 / (fusionK + float64(c.keywordRank)))
+			score += keywordWeight * 0.05 * c.keywordScore
+		}
+
+		if score < minScore {
+			continue
+		}
+		ranked = append(ranked, scored{hit: c.hit, score: score})
+	}
+
+	sort.Slice(ranked, func(i, j int) bool {
+		return ranked[i].score > ranked[j].score
+	})
+
+	if len(ranked) > topK {
+		ranked = ranked[:topK]
+	}
+
+	result := make([]SearchHit, len(ranked))
+	for i, r := range ranked {
+		result[i] = *r.hit
+		result[i].Score = r.score
+	}
+	return result
+}
+
+func (e *ES8Indexer) doSearch(ctx context.Context, req map[string]any) ([]SearchHit, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal search request: %w", err)

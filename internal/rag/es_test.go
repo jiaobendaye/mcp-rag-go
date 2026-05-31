@@ -28,7 +28,8 @@ func (m *mockIndexer) IndexChunks(ctx context.Context, chunks []Chunk, vectors [
 
 // mockSearcher implements Searcher for testing.
 type mockSearcher struct {
-	searchFunc func(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error)
+	searchFunc       func(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error)
+	searchHybridFunc func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error)
 }
 
 func (m *mockSearcher) Search(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
@@ -36,6 +37,17 @@ func (m *mockSearcher) Search(ctx context.Context, queryVector []float32, topK i
 		return m.searchFunc(ctx, queryVector, topK, minScore)
 	}
 	return nil, nil
+}
+
+func (m *mockSearcher) SearchHybrid(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
+	if m.searchHybridFunc != nil {
+		return m.searchHybridFunc(ctx, query, queryVector, topK, minScore)
+	}
+	return nil, nil
+}
+
+func (m *mockSearcher) SearchWithMode(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string) ([]SearchHit, error) {
+	return m.SearchHybrid(ctx, query, queryVector, topK, minScore) // Default to hybrid
 }
 
 func TestGenerateChunkID(t *testing.T) {

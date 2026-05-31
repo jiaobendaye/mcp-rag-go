@@ -66,8 +66,8 @@ func (c *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
 
-	// 2. Search for relevant documents
-	hits, err := c.searcher.Search(ctx, toFloat32(vecs[0]), 5, 0.7)
+	// 2. Search for relevant documents (hybrid by default)
+	hits, err := c.searcher.SearchHybrid(ctx, req.Query, toFloat32(vecs[0]), 5, 0.7)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}

@@ -28,7 +28,8 @@ func (m *mockEmbedder) EmbedStrings(ctx context.Context, texts []string) ([][]fl
 
 // mockSearcher implements rag.Searcher for testing
 type testMockSearcher struct {
-	searchFunc func(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]rag.SearchHit, error)
+	searchFunc       func(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]rag.SearchHit, error)
+	searchHybridFunc func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]rag.SearchHit, error)
 }
 
 func (m *testMockSearcher) Search(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]rag.SearchHit, error) {
@@ -38,6 +39,19 @@ func (m *testMockSearcher) Search(ctx context.Context, queryVector []float32, to
 	return []rag.SearchHit{
 		{ChunkID: "c1", Content: "test", Score: 0.95, Source: "doc1.md", Filename: "doc1.md"},
 	}, nil
+}
+
+func (m *testMockSearcher) SearchHybrid(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]rag.SearchHit, error) {
+	if m.searchHybridFunc != nil {
+		return m.searchHybridFunc(ctx, query, queryVector, topK, minScore)
+	}
+	return []rag.SearchHit{
+		{ChunkID: "c1", Content: "test", Score: 0.95, Source: "doc1.md", Filename: "doc1.md"},
+	}, nil
+}
+
+func (m *testMockSearcher) SearchWithMode(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string) ([]rag.SearchHit, error) {
+	return m.SearchHybrid(ctx, query, queryVector, topK, minScore)
 }
 
 // mockIndexer for pipeline

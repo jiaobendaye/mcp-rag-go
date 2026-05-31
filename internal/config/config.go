@@ -36,6 +36,7 @@ type Config struct {
 	ChunkOverlap int     `yaml:"chunk_overlap"` // chunk overlap, default 200
 	TopK         int     `yaml:"top_k"`         // number of results, default 5
 	MinScore     float64 `yaml:"min_score"`     // minimum similarity score, default 0.7
+	SearchMode   string  `yaml:"search_mode"`   // "hybrid" | "rrf" | "knn", default "hybrid"
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -50,8 +51,9 @@ func DefaultConfig() *Config {
 		LLMModel:          "gpt-4o-mini",
 		ChunkSize:         4000,
 		ChunkOverlap:      200,
-		TopK:              5,
-		MinScore:          0.7,
+		TopK:        5,
+		MinScore:    0.7,
+		SearchMode:  "hybrid",
 	}
 }
 
@@ -93,6 +95,7 @@ func applyEnvOverrides(cfg *Config) {
 		"MCP_RAG_CHUNK_OVERLAP":        func(v string) { cfg.ChunkOverlap = parseInt(v, cfg.ChunkOverlap) },
 		"MCP_RAG_TOP_K":                func(v string) { cfg.TopK = parseInt(v, cfg.TopK) },
 		"MCP_RAG_MIN_SCORE":            func(v string) { cfg.MinScore = parseFloat(v, cfg.MinScore) },
+		"MCP_RAG_SEARCH_MODE":          func(v string) { cfg.SearchMode = v },
 	}
 
 	for envKey, setter := range envMap {

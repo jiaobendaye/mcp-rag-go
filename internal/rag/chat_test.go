@@ -23,7 +23,7 @@ func TestChat(t *testing.T) {
 	t.Run("successful chat", func(t *testing.T) {
 		emb := &mockEmbedder{}
 		searcher := &mockSearcher{
-			searchFunc: func(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
+			searchHybridFunc: func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
 				return []SearchHit{
 					{ChunkID: "c1", Content: "RAG是检索增强生成技术", Score: 0.95, Filename: "doc1.md"},
 				}, nil
@@ -59,7 +59,7 @@ func TestChat(t *testing.T) {
 	t.Run("no results found", func(t *testing.T) {
 		emb := &mockEmbedder{}
 		searcher := &mockSearcher{
-			searchFunc: func(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
+			searchHybridFunc: func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
 				return []SearchHit{}, nil
 			},
 		}
@@ -81,7 +81,7 @@ func TestChat(t *testing.T) {
 	t.Run("LLM failure graceful degradation", func(t *testing.T) {
 		emb := &mockEmbedder{}
 		searcher := &mockSearcher{
-			searchFunc: func(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
+			searchHybridFunc: func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
 				return []SearchHit{
 					{ChunkID: "c1", Content: "test content", Score: 0.9},
 				}, nil
@@ -109,7 +109,7 @@ func TestChat(t *testing.T) {
 	t.Run("search failure propagates", func(t *testing.T) {
 		emb := &mockEmbedder{}
 		searcher := &mockSearcher{
-			searchFunc: func(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
+			searchHybridFunc: func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
 				return nil, errors.New("connection refused")
 			},
 		}

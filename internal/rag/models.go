@@ -53,8 +53,14 @@ type Indexer interface {
 
 // Searcher defines the interface for searching indexed documents.
 type Searcher interface {
-	// Search performs KNN vector search.
+	// Search performs KNN vector search (backward compat).
 	Search(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error)
+
+	// SearchHybrid performs hybrid search based on mode: "hybrid" | "rrf" | "knn".
+	SearchHybrid(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error)
+
+	// SearchWithMode performs search with explicit mode selection.
+	SearchWithMode(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string) ([]SearchHit, error)
 }
 
 // HealthChecker wraps a health check for external services.
