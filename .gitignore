@@ -1,5 +1,36 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+coverage.out
+coverage.html
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data
+data/config.json
+data/knowledge_bases.sqlite3
+data/logs/
+
+# Environment
+.env.local
+
+# Reference (Python source)
 Reference/
 openspec/
 .env
-mcp-rag
-server
