@@ -12,6 +12,7 @@ import (
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
+	"github.com/jiaobendaye/mcp-rag-go/internal/security"
 )
 
 // Server holds all dependencies for HTTP handlers.
@@ -38,6 +39,9 @@ func New(cfg *config.Config, pipeline *rag.IndexPipeline, chatSvc *rag.ChatServi
 func (s *Server) Setup() *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
+
+	// Security middleware (auth + rate-limit, no-op when disabled)
+	r.Use(SecurityMiddleware(s.cfg))
 
 	// System
 	r.GET("/health", s.health)
@@ -72,7 +76,15 @@ func (s *Server) addDocument(c *gin.Context) {
 		return
 	}
 
-	result, err := s.pipeline.IndexText(c.Request.Context(), req.Content, "manual_input")
+		// Index quota check
+		iq := security.NewIndexQuotaPolicy(s.cfg.QuotaMaxIndexDocuments, s.cfg.QuotaMaxIndexChunks, s.cfg.QuotaMaxIndexChars)
+		chars := len([]rune(req.Content))
+		if d := iq.Check(1, 1+chars/s.cfg.ChunkSize, chars); !d.Allowed {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": d.Reason})
+			return
+		}
+		result, err := s.pipeline.IndexText(c.Request.Context(), req.Content, "manual_input")
+
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -96,6 +108,21 @@ func (s *Server) uploadFiles(c *gin.Context) {
 	files := form.File["files"]
 	if len(files) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "No files provided"})
+		return
+	}
+
+	// Upload quota check
+	uploadQuota := security.NewUploadQuotaPolicy(
+		s.cfg.QuotaMaxUploadFiles,
+		s.cfg.QuotaMaxUploadBytes,
+		s.cfg.QuotaMaxUploadFileBytes,
+	)
+	fileSizes := make([]int64, len(files))
+	for i, fh := range files {
+		fileSizes[i] = fh.Size
+	}
+	if decision := uploadQuota.Check(fileSizes); !decision.Allowed {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": decision.Reason})
 		return
 	}
 

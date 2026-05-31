@@ -37,6 +37,25 @@ type Config struct {
 	TopK         int     `yaml:"top_k"`         // number of results, default 5
 	MinScore     float64 `yaml:"min_score"`     // minimum similarity score, default 0.7
 	SearchMode   string  `yaml:"search_mode"`   // "hybrid" | "rrf" | "knn", default "hybrid"
+
+	// Security
+	SecurityEnabled        bool              `yaml:"security_enabled"`
+	SecurityAllowAnonymous  bool              `yaml:"security_allow_anonymous"`
+	SecurityAPIKeys         []string          `yaml:"security_api_keys"`
+	SecurityTenantAPIKeys   map[string][]string `yaml:"security_tenant_api_keys"`
+
+	// Rate Limit
+	RateLimitRequestsPerWindow int `yaml:"rate_limit_requests_per_window"`
+	RateLimitWindowSeconds     int `yaml:"rate_limit_window_seconds"`
+	RateLimitBurst             int `yaml:"rate_limit_burst"`
+
+	// Quotas
+	QuotaMaxUploadFiles      int `yaml:"quota_max_upload_files"`
+	QuotaMaxUploadBytes      int `yaml:"quota_max_upload_bytes"`
+	QuotaMaxUploadFileBytes  int `yaml:"quota_max_upload_file_bytes"`
+	QuotaMaxIndexDocuments   int `yaml:"quota_max_index_documents"`
+	QuotaMaxIndexChunks      int `yaml:"quota_max_index_chunks"`
+	QuotaMaxIndexChars       int `yaml:"quota_max_index_chars"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -54,6 +73,18 @@ func DefaultConfig() *Config {
 		TopK:        5,
 		MinScore:    0.7,
 		SearchMode:  "hybrid",
+
+		SecurityEnabled:            false,
+		SecurityAllowAnonymous:     true,
+		RateLimitRequestsPerWindow: 120,
+		RateLimitWindowSeconds:     60,
+		RateLimitBurst:             30,
+		QuotaMaxUploadFiles:        20,
+		QuotaMaxUploadBytes:        50 * 1024 * 1024,
+		QuotaMaxUploadFileBytes:    10 * 1024 * 1024,
+		QuotaMaxIndexDocuments:     500,
+		QuotaMaxIndexChunks:        2000,
+		QuotaMaxIndexChars:         500000,
 	}
 }
 
@@ -96,6 +127,17 @@ func applyEnvOverrides(cfg *Config) {
 		"MCP_RAG_TOP_K":                func(v string) { cfg.TopK = parseInt(v, cfg.TopK) },
 		"MCP_RAG_MIN_SCORE":            func(v string) { cfg.MinScore = parseFloat(v, cfg.MinScore) },
 		"MCP_RAG_SEARCH_MODE":          func(v string) { cfg.SearchMode = v },
+		"MCP_RAG_SECURITY_ENABLED":     func(v string) { cfg.SecurityEnabled = parseBool(v) },
+		"MCP_RAG_SECURITY_ALLOW_ANON":  func(v string) { cfg.SecurityAllowAnonymous = parseBool(v) },
+		"MCP_RAG_RATE_LIMIT_RPW":       func(v string) { cfg.RateLimitRequestsPerWindow = parseInt(v, cfg.RateLimitRequestsPerWindow) },
+		"MCP_RAG_RATE_LIMIT_WINDOW":    func(v string) { cfg.RateLimitWindowSeconds = parseInt(v, cfg.RateLimitWindowSeconds) },
+		"MCP_RAG_RATE_LIMIT_BURST":     func(v string) { cfg.RateLimitBurst = parseInt(v, cfg.RateLimitBurst) },
+		"MCP_RAG_QUOTA_UPLOAD_FILES":   func(v string) { cfg.QuotaMaxUploadFiles = parseInt(v, cfg.QuotaMaxUploadFiles) },
+		"MCP_RAG_QUOTA_UPLOAD_BYTES":   func(v string) { cfg.QuotaMaxUploadBytes = parseInt(v, cfg.QuotaMaxUploadBytes) },
+		"MCP_RAG_QUOTA_UPLOAD_FILE_BYTES": func(v string) { cfg.QuotaMaxUploadFileBytes = parseInt(v, cfg.QuotaMaxUploadFileBytes) },
+		"MCP_RAG_QUOTA_INDEX_DOCS":     func(v string) { cfg.QuotaMaxIndexDocuments = parseInt(v, cfg.QuotaMaxIndexDocuments) },
+		"MCP_RAG_QUOTA_INDEX_CHUNKS":   func(v string) { cfg.QuotaMaxIndexChunks = parseInt(v, cfg.QuotaMaxIndexChunks) },
+		"MCP_RAG_QUOTA_INDEX_CHARS":    func(v string) { cfg.QuotaMaxIndexChars = parseInt(v, cfg.QuotaMaxIndexChars) },
 	}
 
 	for envKey, setter := range envMap {
@@ -129,6 +171,14 @@ func parseFloat(s string, defaultVal float64) float64 {
 	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
 	if err != nil {
 		return defaultVal
+	}
+	return v
+}
+
+func parseBool(s string) bool {
+	v, err := strconv.ParseBool(strings.TrimSpace(s))
+	if err != nil {
+		return false
 	}
 	return v
 }
