@@ -11,6 +11,7 @@ import (
 	"github.com/cloudwego/eino/components/document"
 	"github.com/cloudwego/eino/compose"
 	"github.com/gin-gonic/gin"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
@@ -21,12 +22,14 @@ import (
 // Server holds all dependencies for HTTP handlers.
 type Server struct {
 	cfg        *config.Config
-	chain compose.Runnable[document.Source, []string]
+	chain      compose.Runnable[document.Source, []string]
 	chatSvc    *rag.ChatService
 	searcher   rag.Searcher
 	embedder   rag.Embedder
 	kbs        *knowledgebase.Service
 	esIndexer  *rag.ES8Indexer
+	mcpSrv     *mcpserver.MCPServer
+	mcpHandler *mcpserver.StreamableHTTPServer
 }
 
 // New creates a new Server with all dependencies.
@@ -69,6 +72,15 @@ func (s *Server) Setup() *gin.Engine {
 	// Search & Chat
 	r.GET("/search", s.search)
 	r.POST("/chat", s.chat)
+
+	// MCP (Streamable HTTP)
+	s.mcpSrv, s.mcpHandler = s.InitMCP()
+	r.Any("/mcp", gin.WrapH(s.mcpHandler))
+	r.Any("/mcp/*path", gin.WrapH(s.mcpHandler))
+
+	// Debug endpoints
+	r.GET("/debug/mcp/tools", s.mcpListTools)
+	r.POST("/debug/mcp/call", s.mcpDebugCall)
 
 	return r
 }
