@@ -82,13 +82,9 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 		return mcp.NewToolResultError("query is required"), nil
 	}
 
-	// Extract mode (raw or summary)
 	mode := request.GetString("mode", "raw")
-
-	// Extract collection (for legacy KB resolution)
 	collection := request.GetString("collection", "default")
 
-	// Extract KB parameters
 	kbID := request.GetInt("kb_id", 0)
 	kbIDsRaw := extractKBIDsArg(request.Params.Arguments)
 	kbIDs := mcpExtractKBIDs(kbIDsRaw)
@@ -96,7 +92,6 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 	userID := request.GetInt("user_id", 0)
 	agentID := request.GetInt("agent_id", 0)
 
-	// Extract search parameters
 	limit := request.GetInt("limit", 5)
 	if limit < 1 {
 		limit = 1
@@ -118,7 +113,7 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 		return s.handleRagAskMultiKB(ctx, query, mode, kbIDs, limit, threshold)
 	}
 
-	// Resolve KB to get index name
+	// Resolve KB
 	_, indexName, err := s.resolveMCPKB(kbID, scope, userID, agentID, collection)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("知识库解析失败: %v", err)), nil
@@ -178,63 +173,59 @@ func (s *Server) resolveMCPKB(kbID int, scope string, userID, agentID int, colle
 
 // handleRawMode performs search-only and returns formatted text.
 func (s *Server) handleRawMode(ctx context.Context, query string, limit int, threshold float64, indexName string) (*mcp.CallToolResult, error) {
-	// Embed query
-	vecs, err := s.embedder.EmbedStrings(ctx, []string{query})
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("向量化失败: %v", err)), nil
-	}
-
-	// Search with configured mode
-	hits, err := s.searcher.SearchWithMode(ctx, query, toFloat32(vecs[0]), limit, threshold, s.cfg.SearchMode)
+	docs, err := s.retrieveAt(ctx, s.kbRetriever, indexName, query, limit, threshold, s.cfg.SearchMode)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("检索失败: %v", err)), nil
 	}
 
-	if len(hits) == 0 {
+	if len(docs) == 0 {
 		return mcp.NewToolResultText(fmt.Sprintf("未找到与 \"%s\" 相关的信息。", query)), nil
 	}
 
-	// Format results as text
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("查询: %s\n", query))
-	sb.WriteString(fmt.Sprintf("模式: 检索 (共%d条结果)\n\n", len(hits)))
-	for i, h := range hits {
-		sb.WriteString(fmt.Sprintf("--- 结果 %d (相似度: %.3f) ---\n", i+1, h.Score))
-		if h.Filename != "" {
-			sb.WriteString(fmt.Sprintf("文件: %s\n", h.Filename))
+	sb.WriteString(fmt.Sprintf("模式: 检索 (共%d条结果)\n\n", len(docs)))
+	for i, d := range docs {
+		var score float64
+		if v, ok := d.MetaData["score"]; ok {
+			score, _ = v.(float64)
 		}
-		if h.Source != "" {
-			sb.WriteString(fmt.Sprintf("来源: %s\n", h.Source))
+		var filename, source string
+		if v, ok := d.MetaData["filename"].(string); ok {
+			filename = v
 		}
-		sb.WriteString(fmt.Sprintf("\n%s\n\n", h.Content))
+		if v, ok := d.MetaData["source"].(string); ok {
+			source = v
+		}
+		sb.WriteString(fmt.Sprintf("--- 结果 %d (相似度: %.3f) ---\n", i+1, score))
+		if filename != "" {
+			sb.WriteString(fmt.Sprintf("文件: %s\n", filename))
+		}
+		if source != "" {
+			sb.WriteString(fmt.Sprintf("来源: %s\n", source))
+		}
+		sb.WriteString(fmt.Sprintf("\n%s\n\n", d.Content))
 	}
 
 	return mcp.NewToolResultText(sb.String()), nil
 }
 
-// handleSummaryMode uses ChatService for search + LLM summary.
+// handleSummaryMode uses the per-request BuildRetrievalGraphAt to
+// retrieve + LLM summary.
 func (s *Server) handleSummaryMode(ctx context.Context, query string, limit int, threshold float64, indexName string) (*mcp.CallToolResult, error) {
-	resp, err := s.chatSvc.Chat(ctx, &rag.ChatRequest{Query: query})
+	runnable, err := rag.BuildRetrievalGraphAt(ctx, s.kbRetriever, s.llm, s.embedder, indexName, s.cfg.SearchMode, limit, threshold)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("构造检索图失败: %v", err)), nil
+	}
+	answer, err := runnable.Invoke(ctx, query)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
 	}
 
-	// Format response with sources
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("查询: %s\n", resp.Query))
-	sb.WriteString(fmt.Sprintf("模式: 总结\n\n"))
-	sb.WriteString(resp.Response)
-	if len(resp.Sources) > 0 {
-		sb.WriteString("\n\n--- 参考来源 ---\n")
-		for i, src := range resp.Sources {
-			sb.WriteString(fmt.Sprintf("%d. [相似度: %.3f]", i+1, src.Score))
-			if src.Filename != "" {
-				sb.WriteString(fmt.Sprintf(" 文件: %s", src.Filename))
-			}
-			sb.WriteString("\n")
-		}
-	}
-
+	sb.WriteString(fmt.Sprintf("查询: %s\n", query))
+	sb.WriteString("模式: 总结\n\n")
+	sb.WriteString(answer)
 	return mcp.NewToolResultText(sb.String()), nil
 }
 
@@ -273,7 +264,6 @@ func (s *Server) mcpDebugCall(c *gin.Context) {
 		return
 	}
 
-	// Build CallToolRequest
 	callReq := mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
 			Name:      req.Tool,
@@ -287,7 +277,6 @@ func (s *Server) mcpDebugCall(c *gin.Context) {
 		return
 	}
 
-	// Extract text content from result
 	var texts []string
 	for _, content := range result.Content {
 		if textContent, ok := content.(mcp.TextContent); ok {
@@ -345,9 +334,10 @@ func mcpExtractKBIDs(raw any) []int64 {
 	return nil
 }
 
-// handleRagAskMultiKB performs multi-KB retrieval for MCP rag_ask.
+// handleRagAskMultiKB performs multi-KB retrieval for MCP rag_ask. Per
+// goroutine: build a per-request BuildRetrievalGraphAt compile, invoke
+// it, get the answer. Aggregate by joining answers per KB.
 func (s *Server) handleRagAskMultiKB(ctx context.Context, query string, mode string, kbIDs []int64, limit int, threshold float64) (*mcp.CallToolResult, error) {
-	// Resolve KBs
 	type kbInfo struct {
 		kb        *knowledgebase.KnowledgeBase
 		indexName string
@@ -371,71 +361,100 @@ func (s *Server) handleRagAskMultiKB(ctx context.Context, query string, mode str
 		return mcp.NewToolResultError("no valid knowledge bases found"), nil
 	}
 
-	// Embed once
-	vecs, err := s.embedder.EmbedStrings(ctx, []string{query})
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("向量化失败: %v", err)), nil
+	type result struct {
+		kbName string
+		docs   []*rag.RetrievedDoc
+		err    error
 	}
-	queryVec := toFloat32(vecs[0])
+	results := make([]result, len(kbs))
 
-	// Parallel search
-	type searchResult struct {
-		hits []rag.SearchHit
-		err  error
+	// For raw mode: per-KB Retrieve; for summary mode: per-KB BuildRetrievalGraphAt
+	if mode == "summary" {
+		var wg sync.WaitGroup
+		for i, kb := range kbs {
+			wg.Add(1)
+			go func(idx int, info kbInfo) {
+				defer wg.Done()
+				runnable, err := rag.BuildRetrievalGraphAt(ctx, s.kbRetriever, s.llm, s.embedder, info.indexName, s.cfg.SearchMode, limit, threshold)
+				if err != nil {
+					results[idx] = result{kbName: info.kb.Name, err: err}
+					return
+				}
+				answer, err := runnable.Invoke(ctx, query)
+				if err != nil {
+					results[idx] = result{kbName: info.kb.Name, err: err}
+					return
+				}
+				// Wrap answer as a single "doc" for the aggregator
+				results[idx] = result{kbName: info.kb.Name, docs: []*rag.RetrievedDoc{{Content: answer, MetaData: map[string]any{"_answer_only": true}}}}
+			}(i, kb)
+		}
+		wg.Wait()
+	} else {
+		var wg sync.WaitGroup
+		for i, kb := range kbs {
+			wg.Add(1)
+			go func(idx int, info kbInfo) {
+				defer wg.Done()
+				docs, err := s.retrieveAt(ctx, s.kbRetriever, info.indexName, query, limit, threshold, s.cfg.SearchMode)
+				results[idx] = result{kbName: info.kb.Name, docs: docs, err: err}
+			}(i, kb)
+		}
+		wg.Wait()
 	}
-	results := make([]searchResult, len(kbs))
-	var wg sync.WaitGroup
-	for i, kb := range kbs {
-		wg.Add(1)
-		go func(idx int, info kbInfo) {
-			defer wg.Done()
-			hits, err := s.searcher.SearchWithMode(ctx, query, queryVec, limit, threshold, s.cfg.SearchMode)
-			results[idx] = searchResult{hits: hits, err: err}
-		}(i, kb)
-	}
-	wg.Wait()
 
-	// Collect and aggregate
-	var kbResults []rag.KBSearchResult
-	for i, info := range kbs {
-		r := results[i]
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("查询: %s\n", query))
+	if mode == "summary" {
+		sb.WriteString(fmt.Sprintf("模式: 跨%d个知识库总结\n\n", len(kbIDs)))
+		for _, r := range results {
+			if r.err != nil {
+				continue
+			}
+			if len(r.docs) == 0 {
+				continue
+			}
+			fmt.Fprintf(&sb, "## %s\n\n%s\n\n", r.kbName, r.docs[0].Content)
+		}
+		return mcp.NewToolResultText(sb.String()), nil
+	}
+
+	// raw mode: list all hits
+	totalHits := 0
+	for _, r := range results {
+		if r.err == nil {
+			totalHits += len(r.docs)
+		}
+	}
+	if totalHits == 0 {
+		return mcp.NewToolResultText(fmt.Sprintf("未找到与 \"%s\" 相关的信息。", query)), nil
+	}
+	sb.WriteString(fmt.Sprintf("模式: 跨%d个知识库检索 (共%d条结果)\n\n", len(kbIDs), totalHits))
+	for _, r := range results {
 		if r.err != nil {
 			continue
 		}
-		kbResults = append(kbResults, rag.KBSearchResult{
-			KBID:         info.kb.ID,
-			KBName:       info.kb.Name,
-			KBScope:      string(info.kb.Scope),
-			OwnerUserID:  info.kb.OwnerUserID,
-			OwnerAgentID: info.kb.OwnerAgentID,
-			Hits:         r.hits,
-		})
-	}
-
-	aggregated := rag.AggregateResults(kbResults, limit)
-
-	if len(aggregated) == 0 {
-		return mcp.NewToolResultText(fmt.Sprintf("未找到与 \"%s\" 相关的信息。", query)), nil
-	}
-
-	// Format results
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("查询: %s\n", query))
-	sb.WriteString(fmt.Sprintf("模式: 跨%d个知识库检索 (共%d条结果)\n\n", len(kbIDs), len(aggregated)))
-	for i, ar := range aggregated {
-		sb.WriteString(fmt.Sprintf("--- 结果 %d (相似度: %.3f, 知识库: %s) ---\n", i+1, ar.Score, ar.KBName))
-		if ar.Filename != "" {
-			sb.WriteString(fmt.Sprintf("文件: %s\n", ar.Filename))
+		for i, d := range r.docs {
+			var score float64
+			if v, ok := d.MetaData["score"]; ok {
+				score, _ = v.(float64)
+			}
+			var filename, source string
+			if v, ok := d.MetaData["filename"].(string); ok {
+				filename = v
+			}
+			if v, ok := d.MetaData["source"].(string); ok {
+				source = v
+			}
+			sb.WriteString(fmt.Sprintf("--- [%s] 结果 %d (相似度: %.3f) ---\n", r.kbName, i+1, score))
+			if filename != "" {
+				sb.WriteString(fmt.Sprintf("文件: %s\n", filename))
+			}
+			if source != "" {
+				sb.WriteString(fmt.Sprintf("来源: %s\n", source))
+			}
+			sb.WriteString(fmt.Sprintf("\n%s\n\n", d.Content))
 		}
-		if ar.Source != "" {
-			sb.WriteString(fmt.Sprintf("来源: %s\n", ar.Source))
-		}
-		sb.WriteString(fmt.Sprintf("\n%s\n\n", ar.Content))
-	}
-
-	if mode == "summary" {
-		sb.WriteString("--- 摘要模式 ---\n")
-		sb.WriteString("跨知识库摘要生成功能暂未启用。")
 	}
 
 	return mcp.NewToolResultText(sb.String()), nil

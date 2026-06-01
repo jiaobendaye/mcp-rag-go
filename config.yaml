@@ -23,7 +23,7 @@ llm_base_url: "https://zhi8.xf.bj.cn/onehub/v1"
 chunk_size: 4000       # characters per chunk
 chunk_overlap: 200     # overlap between chunks
 top_k: 5               # max search results
-min_score: 0.7         # minimum similarity threshold
+min_score: 0.2         # minimum similarity threshold (hybrid BM25+knn)
 search_mode: "hybrid"  # "hybrid" (manual KNN+BM25 fusion, free) | "rrf" (native, needs license) | "knn" (vector only)
 
 # Security (disabled by default, enable for production)

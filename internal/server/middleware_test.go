@@ -10,17 +10,15 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
-	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
 )
 
 func setupSecureServer(securityCfg *config.Config) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 
 	emb := &httpTestEmbedder{}
-	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{}, nil)
 	searcher := &testMockSearcher{}
 
-	s := New(securityCfg, nil, nil, nil, nil, chatSvc, searcher, emb, nil, nil, 0)
+	s := New(securityCfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, searcher, nil, nil, 0)
 	return s.Setup()
 }
 

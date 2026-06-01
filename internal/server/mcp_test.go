@@ -10,13 +10,13 @@ import (
 
 	"github.com/cloudwego/eino/components/embedding"
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
 	"github.com/gin-gonic/gin"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
-	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
 )
 
 // mcpTestEmbedder implements eino embedding.Embedder
@@ -41,35 +41,20 @@ func (m *mcpTestLLM) Stream(ctx context.Context, input []*schema.Message, _ ...m
 	return nil, nil
 }
 
-// mcpTestSearcher implements rag.Searcher
+// mcpTestSearcher implements eino retriever.Retriever. The default returns
+// two stub documents so the raw mode handler has something to format.
 type mcpTestSearcher struct {
-	searchFunc       func(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]rag.SearchHit, error)
-	searchHybridFunc func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]rag.SearchHit, error)
+	retrieveFunc func(ctx context.Context, query string, opts ...retriever.Option) ([]*schema.Document, error)
 }
 
-func (m *mcpTestSearcher) Search(ctx context.Context, qv []float32, tk int, ms float64) ([]rag.SearchHit, error) {
-	if m.searchFunc != nil {
-		return m.searchFunc(ctx, qv, tk, ms)
+func (m *mcpTestSearcher) Retrieve(ctx context.Context, query string, opts ...retriever.Option) ([]*schema.Document, error) {
+	if m.retrieveFunc != nil {
+		return m.retrieveFunc(ctx, query, opts...)
 	}
-	return []rag.SearchHit{}, nil
-}
-
-func (m *mcpTestSearcher) SearchHybrid(ctx context.Context, q string, qv []float32, tk int, ms float64) ([]rag.SearchHit, error) {
-	if m.searchHybridFunc != nil {
-		return m.searchHybridFunc(ctx, q, qv, tk, ms)
-	}
-	return []rag.SearchHit{
-		{ChunkID: "c1", DocumentID: "d1", Content: "测试内容1", Score: 0.95, Filename: "test.txt", Source: "test.txt"},
-		{ChunkID: "c2", DocumentID: "d2", Content: "测试内容2", Score: 0.85, Filename: "test2.txt", Source: "test2.txt"},
+	return []*schema.Document{
+		{ID: "c1", Content: "测试内容1", MetaData: map[string]any{"score": 0.95, "filename": "test.txt", "source": "test.txt", "chunk_id": "c1", "document_id": "d1"}},
+		{ID: "c2", Content: "测试内容2", MetaData: map[string]any{"score": 0.85, "filename": "test2.txt", "source": "test2.txt", "chunk_id": "c2", "document_id": "d2"}},
 	}, nil
-}
-
-func (m *mcpTestSearcher) SearchWithMode(ctx context.Context, q string, qv []float32, tk int, ms float64, mode string) ([]rag.SearchHit, error) {
-	return m.SearchHybrid(ctx, q, qv, tk, ms)
-}
-
-func (m *mcpTestSearcher) SearchWithWeights(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string, weights rag.SearchWeights) ([]rag.SearchHit, error) {
-	return m.SearchWithMode(ctx, query, queryVector, topK, minScore, mode)
 }
 
 // setupMCPServer creates a test Server with MCP support.
@@ -90,9 +75,8 @@ func setupMCPServer(t *testing.T) *gin.Engine {
 	cfg := config.DefaultConfig()
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
-	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{}, nil)
 
-	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil, 0)
+	s := New(cfg, nil, nil, nil, emb, nil, &mcpTestLLM{}, nil, searcher, nil, kbs, 0)
 	return s.Setup()
 }
 
@@ -113,8 +97,7 @@ func TestMCPRagAskParameterParsing(t *testing.T) {
 	cfg := config.DefaultConfig()
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
-	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{}, nil)
-	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil, 0)
+	s := New(cfg, nil, nil, nil, emb, nil, &mcpTestLLM{}, nil, searcher, nil, kbs, 0)
 
 	// Init MCP server (stores mcpSrv on the Server)
 	s.mcpSrv, s.mcpHandler = s.InitMCP()
@@ -268,8 +251,7 @@ func TestMCPToolsRegistered(t *testing.T) {
 	cfg := config.DefaultConfig()
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
-	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{}, nil)
-	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil, 0)
+	s := New(cfg, nil, nil, nil, emb, nil, &mcpTestLLM{}, nil, searcher, nil, kbs, 0)
 	s.mcpSrv, s.mcpHandler = s.InitMCP()
 
 	tools := s.mcpSrv.ListTools()

@@ -14,8 +14,14 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/cobra"
 
+	"github.com/cloudwego/eino/components/document"
+
+	elastic_indexer "github.com/cloudwego/eino-ext/components/indexer/es8"
+	elastic_retriever "github.com/cloudwego/eino-ext/components/retriever/es8"
+	elastic_search_mode "github.com/cloudwego/eino-ext/components/retriever/es8/search_mode"
 	openaiembed "github.com/cloudwego/eino-ext/components/embedding/openai"
 	openaimodel "github.com/cloudwego/eino-ext/components/model/openai"
+	"github.com/cloudwego/eino-ext/components/document/transformer/splitter/recursive"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
@@ -46,6 +52,33 @@ func main() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+}
+
+// indexSpecForDims returns the IndexSpec used by eino-ext to auto-create
+// ES indices for our content_vector + content + metadata field shape.
+// dims is the embedding dimension.
+func indexSpecForDims(dims int) *elastic_indexer.IndexSpec {
+	return &elastic_indexer.IndexSpec{
+		Settings: map[string]any{
+			"number_of_shards":   1,
+			"number_of_replicas": 0,
+		},
+		Mappings: map[string]any{
+			"dynamic": "strict",
+			"properties": map[string]any{
+				"content":        map[string]any{"type": "text"},
+				"content_vector": map[string]any{"type": "dense_vector", "dims": dims, "similarity": "cosine"},
+				"document_id":    map[string]any{"type": "keyword"},
+				"chunk_index":    map[string]any{"type": "integer"},
+				"total_chunks":   map[string]any{"type": "integer"},
+				"chunk_id":       map[string]any{"type": "keyword"},
+				"source":         map[string]any{"type": "keyword"},
+				"filename":       map[string]any{"type": "keyword"},
+				"file_type":      map[string]any{"type": "keyword"},
+				"processed_at":   map[string]any{"type": "date"},
+			},
+		},
 	}
 }
 
@@ -106,10 +139,42 @@ func runServe(cmd *cobra.Command, args []string) error {
 	dims := len(vecs[0])
 	log.Printf("Embedding dims: %d", dims)
 
-	// ES indexer
-	esIndexer := rag.NewES8Indexer(esClient, defaultKB.IndexName())
-	if err := esIndexer.EnsureIndex(ctx, dims); err != nil {
-		return fmt.Errorf("ensure index: %w", err)
+	// Splitter (used as a transformer template by per-request compile)
+	splitter, err := newSplitter(ctx, cfg.ChunkSize, cfg.ChunkOverlap)
+	if err != nil {
+		return fmt.Errorf("create splitter: %w", err)
+	}
+
+	// KB indexer (template; per-call index routing via WithIndex)
+	kbIndexer, err := rag.NewKBIndexer(ctx, &elastic_indexer.IndexerConfig{
+		Client:           esClient,
+		Index:            rag.PlaceholderIndex,
+		IndexSpec:        indexSpecForDims(dims),
+		DocumentToFields: rag.ProjectDocumentToFields(),
+		Embedding:        embedder,
+	})
+	if err != nil {
+		return fmt.Errorf("create kb indexer: %w", err)
+	}
+
+	// Ensure default KB's index exists
+	if err := kbIndexer.EnsureIndexForKB(ctx, defaultKB.IndexName()); err != nil {
+		log.Printf("WARNING: ensure default index: %v", err)
+	}
+
+	// KB retriever (template; per-call index routing via WithIndex)
+	minScore := cfg.MinScore
+	kbRetriever, err := rag.NewKBRetriever(ctx, &elastic_retriever.RetrieverConfig{
+		Client:         esClient,
+		Index:          rag.PlaceholderIndex,
+		TopK:           cfg.TopK,
+		ScoreThreshold: &minScore,
+		SearchMode:     elastic_search_mode.SearchModeRawStringRequest(),
+		ResultParser:   rag.ProjectResultParser(),
+		Embedding:      embedder,
+	})
+	if err != nil {
+		return fmt.Errorf("create kb retriever: %w", err)
 	}
 
 	// eino-ext LLM
@@ -122,24 +187,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("create llm: %w", err)
 	}
 
-	// Build index chain
-	chain, err := rag.BuildIndexChain(ctx, embedder, esIndexer, cfg.ChunkSize, cfg.ChunkOverlap)
-	if err != nil {
-		return fmt.Errorf("build index chain: %w", err)
-	}
-
-	// Build retrieval graph
-	graph, err := rag.BuildRetrievalGraph(ctx, embedder, esIndexer, llm, cfg.SearchMode)
-	if err != nil {
-		return fmt.Errorf("build retrieval graph: %w", err)
-	}
-
-	// Services
-	chatSvc := rag.NewChatService(esIndexer, embedder, llm, graph)
-
 	// Setup HTTP
 	gin.SetMode(gin.ReleaseMode)
-	srv := server.New(cfg, configManager, metricsCollector, retrievalCache, chain, chatSvc, esIndexer, embedder, kbService, esIndexer, dims)
+	srv := server.New(cfg, configManager, metricsCollector, retrievalCache,
+		embedder, splitter, llm, kbIndexer, kbRetriever, esClient, kbService, dims)
 	router := srv.Setup()
 
 	httpServer := &http.Server{Addr: fmt.Sprintf(":%d", cfg.HTTPPort), Handler: router}
@@ -153,4 +204,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	log.Printf("MCP-RAG listening on :%d", cfg.HTTPPort)
 	return httpServer.ListenAndServe()
+}
+
+// newSplitter creates a recursive text splitter transformer configured
+// with the project's chunk size and overlap. Per-request compile in
+// BuildIndexChainAt reuses the same splitter for every request.
+func newSplitter(ctx context.Context, chunkSize, overlap int) (document.Transformer, error) {
+	return recursive.NewSplitter(ctx, &recursive.Config{
+		ChunkSize:   chunkSize,
+		OverlapSize: overlap,
+	})
 }

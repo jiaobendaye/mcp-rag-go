@@ -11,12 +11,12 @@ import (
 
 	"github.com/cloudwego/eino/components/embedding"
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
 	"github.com/gin-gonic/gin"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
-	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
 )
 
 // httpTestEmbedder implements eino embedding.Embedder
@@ -46,40 +46,31 @@ func (m *mockLLM) Stream(ctx context.Context, input []*schema.Message, _ ...mode
 	return nil, nil
 }
 
-// testMockSearcher implements rag.Searcher
+// testMockSearcher implements eino retriever.Retriever. It returns a
+// preconfigured slice of *schema.Document; tests that need different
+// per-call behavior can set retrieveFunc.
 type testMockSearcher struct {
-	searchFunc       func(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]rag.SearchHit, error)
-	searchHybridFunc func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]rag.SearchHit, error)
+	retrieveFunc func(ctx context.Context, query string, opts ...retriever.Option) ([]*schema.Document, error)
 }
 
-func (m *testMockSearcher) Search(ctx context.Context, qv []float32, tk int, ms float64) ([]rag.SearchHit, error) {
-	if m.searchFunc != nil {
-		return m.searchFunc(ctx, qv, tk, ms)
+func (m *testMockSearcher) Retrieve(ctx context.Context, query string, opts ...retriever.Option) ([]*schema.Document, error) {
+	if m.retrieveFunc != nil {
+		return m.retrieveFunc(ctx, query, opts...)
 	}
-	return []rag.SearchHit{}, nil
-}
-
-func (m *testMockSearcher) SearchHybrid(ctx context.Context, q string, qv []float32, tk int, ms float64) ([]rag.SearchHit, error) {
-	if m.searchHybridFunc != nil {
-		return m.searchHybridFunc(ctx, q, qv, tk, ms)
-	}
-	return []rag.SearchHit{{ChunkID: "c1", Content: "test", Score: 0.95}}, nil
-}
-
-func (m *testMockSearcher) SearchWithMode(ctx context.Context, q string, qv []float32, tk int, ms float64, mode string) ([]rag.SearchHit, error) {
-	return m.SearchHybrid(ctx, q, qv, tk, ms)
-}
-
-func (m *testMockSearcher) SearchWithWeights(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string, weights rag.SearchWeights) ([]rag.SearchHit, error) {
-	return m.SearchWithMode(ctx, query, queryVector, topK, minScore, mode)
+	// Default: one stub doc with a useful metadata payload.
+	return []*schema.Document{{
+		ID:       "c1",
+		Content:  "test",
+		MetaData: map[string]any{"score": 0.95, "filename": "test.txt", "source": "test.txt", "chunk_id": "c1", "document_id": "d1", "chunk_index": 0},
+	}}, nil
 }
 
 func setupTestServer() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	cfg := config.DefaultConfig()
 	emb := &httpTestEmbedder{}
-	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{}, nil)
-	s := New(cfg, nil, nil, nil, nil, chatSvc, &testMockSearcher{}, emb, nil, nil, 0)
+	searcher := &testMockSearcher{}
+	s := New(cfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, searcher, nil, nil, 0)
 	return s.Setup()
 }
 
@@ -95,8 +86,8 @@ func setupTestServerWithKB(t *testing.T) (*gin.Engine, *knowledgebase.Service) {
 		t.Fatalf("knowledgebase.NewService: %v", err)
 	}
 	emb := &httpTestEmbedder{}
-	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{}, nil)
-	s := New(cfg, nil, nil, nil, nil, chatSvc, &testMockSearcher{}, emb, svc, nil, 0)
+	searcher := &testMockSearcher{}
+	s := New(cfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, searcher, nil, svc, 0)
 	return s.Setup(), svc
 }
 
@@ -168,7 +159,10 @@ func TestSearchEndpoint(t *testing.T) {
 }
 
 func TestChatEndpoint(t *testing.T) {
-	r := setupTestServer()
+	// /chat now resolves a KB on every request, so the test server must
+	// have a real KB service. setupTestServerWithKB seeds an in-memory
+	// SQLite KB.
+	r, _ := setupTestServerWithKB(t)
 	t.Run("valid chat", func(t *testing.T) {
 		body := `{"query":"什么是RAG"}`
 		w := httptest.NewRecorder()
@@ -878,7 +872,7 @@ func TestAddDocument_CacheInvalidatesIndexerIndex(t *testing.T) {
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 (no chain), got %d (body: %s)", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "index chain not configured") {
-		t.Errorf("expected chain-not-configured error, got: %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "indexer not configured") {
+		t.Errorf("expected indexer-not-configured error, got: %s", w.Body.String())
 	}
 }

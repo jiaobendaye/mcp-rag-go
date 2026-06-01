@@ -14,7 +14,8 @@ import (
 	"sync"
 
 	"github.com/cloudwego/eino/components/document"
-	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/components/retriever"
+	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/gin-gonic/gin"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
@@ -31,16 +32,25 @@ type Server struct {
 	configManager    *config.ConfigManager
 	metricsCollector *observability.MetricsCollector
 	retrievalCache   *rag.RetrievalCache
-	chain            compose.Runnable[document.Source, []string]
-	chatSvc          *rag.ChatService
-	searcher         rag.Searcher
-	embedder         rag.Embedder
-	kbs              *knowledgebase.Service
-	esIndexer        *rag.ES8Indexer
-	embedDims        int // probed embedding dimensions, used for EnsureIndex on new KBs
-	classifier        *rag.QueryClassifier
-	mcpSrv           *mcpserver.MCPServer
-	mcpHandler       *mcpserver.StreamableHTTPServer
+
+	// Per-request compile components
+	splitter    document.Transformer
+	embedder    rag.Embedder
+	llm         rag.LLMGenerator
+	kbIndexer   *rag.KBIndexer
+	kbRetriever retriever.Retriever
+
+	// Direct ES client for admin endpoints
+	esClient *elasticsearch.Client
+
+	// Knowledge base service
+	kbs *knowledgebase.Service
+
+	embedDims int
+	classifier *rag.QueryClassifier
+
+	mcpSrv     *mcpserver.MCPServer
+	mcpHandler *mcpserver.StreamableHTTPServer
 }
 
 // New creates a new Server with all dependencies.
@@ -49,12 +59,13 @@ func New(
 	configManager *config.ConfigManager,
 	metricsCollector *observability.MetricsCollector,
 	retrievalCache *rag.RetrievalCache,
-	chain compose.Runnable[document.Source, []string],
-	chatSvc *rag.ChatService,
-	searcher rag.Searcher,
 	embedder rag.Embedder,
+	splitter document.Transformer,
+	llm rag.LLMGenerator,
+	kbIndexer *rag.KBIndexer,
+	kbRetriever retriever.Retriever,
+	esClient *elasticsearch.Client,
 	kbs *knowledgebase.Service,
-	esIndexer *rag.ES8Indexer,
 	embedDims int,
 ) *Server {
 	return &Server{
@@ -62,14 +73,15 @@ func New(
 		configManager:    configManager,
 		metricsCollector: metricsCollector,
 		retrievalCache:   retrievalCache,
-		chain:            chain,
-		chatSvc:          chatSvc,
-		searcher:         searcher,
 		embedder:         embedder,
+		splitter:         splitter,
+		llm:              llm,
+		kbIndexer:        kbIndexer,
+		kbRetriever:      kbRetriever,
+		esClient:         esClient,
 		kbs:              kbs,
-		esIndexer:        esIndexer,
 		embedDims:        embedDims,
-		classifier:        rag.NewQueryClassifier(),
+		classifier:       rag.NewQueryClassifier(),
 	}
 }
 
@@ -78,7 +90,7 @@ func (s *Server) Setup() *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
-	// Request tracing middleware (must be before SecurityMiddleware to set headers early)
+	// Request tracing middleware (must before SecurityMiddleware to set headers early)
 	r.Use(TracingMiddleware())
 
 	// Security middleware (auth + rate-limit, no-op when disabled)
@@ -142,12 +154,18 @@ func (s *Server) Setup() *gin.Engine {
 }
 
 // resolveKB resolves kb_id or legacy collection to a concrete ES index.
-func (s *Server) resolveKB(c *gin.Context) (*knowledgebase.Resolution, string, error) {
+// bodyKBID is an optional explicit kb_id supplied by the caller (e.g. from
+// a JSON request body); if non-nil it takes precedence over the URL query
+// `kb_id` parameter. Pass nil to read from the URL query only.
+func (s *Server) resolveKB(c *gin.Context, bodyKBID *int64) (*knowledgebase.Resolution, string, error) {
 	if s.kbs == nil {
 		return nil, "", fmt.Errorf("knowledge base service not configured")
 	}
 
-	kbID := parseIntPtr(c.Query("kb_id"))
+	kbID := bodyKBID
+	if kbID == nil {
+		kbID = parseIntPtr(c.Query("kb_id"))
+	}
 	scope := strPtr(c.Query("scope"))
 	collection := c.Query("collection")
 	if collection == "" {
@@ -236,11 +254,14 @@ func (s *Server) health(c *gin.Context) {
 	}
 
 	// Determine readiness
-	bootstrapped := s.embedder != nil && s.esIndexer != nil && s.kbs != nil
+	bootstrapped := s.embedder != nil && s.kbIndexer != nil && s.kbs != nil
 	ready := bootstrapped
-	if ready && s.esIndexer != nil {
-		if err := s.esIndexer.HealthCheck(context.Background()); err != nil {
+	if ready && s.esClient != nil {
+		res, err := s.esClient.Ping()
+		if err != nil {
 			ready = false
+		} else {
+			res.Body.Close()
 		}
 	}
 	healthy := ready
@@ -294,14 +315,14 @@ func (s *Server) buildRuntimeSnapshot() gin.H {
 	}
 
 	// document_processor
-	if s.chain != nil {
+	if s.kbIndexer != nil {
 		runtime["document_processor"] = "ready"
 	} else {
 		runtime["document_processor"] = nil
 	}
 
 	// hybrid_service
-	if s.searcher != nil {
+	if s.kbRetriever != nil {
 		runtime["hybrid_service"] = "ready"
 	} else {
 		runtime["hybrid_service"] = nil
@@ -342,16 +363,19 @@ func (s *Server) ready(c *gin.Context) {
 		revision = s.configManager.Revision()
 	}
 
-	bootstrapped := s.embedder != nil && s.esIndexer != nil && s.kbs != nil
+	bootstrapped := s.embedder != nil && s.kbIndexer != nil && s.kbs != nil
 	ready := bootstrapped
 	reasons := []string{}
 	if !bootstrapped {
 		reasons = append(reasons, "service not fully bootstrapped")
 	}
-	if ready && s.esIndexer != nil {
-		if err := s.esIndexer.HealthCheck(context.Background()); err != nil {
+	if ready && s.esClient != nil {
+		res, err := s.esClient.Ping()
+		if err != nil {
 			ready = false
 			reasons = append(reasons, "elasticsearch not reachable")
+		} else {
+			res.Body.Close()
 		}
 	}
 
@@ -630,16 +654,16 @@ func (s *Server) configReload(c *gin.Context) {
 	})
 }
 
-// listDocuments returns paginated documents.
+// listDocuments returns paginated documents. Admin operation: uses raw ES client.
 func (s *Server) listDocuments(c *gin.Context) {
-	_, indexName, err := s.resolveKB(c)
+	_, indexName, err := s.resolveKB(c, nil)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "100"))
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
-	result, err := s.esIndexer.ListDocuments(indexName, limit, offset)
+	result, err := rag.AdminListDocuments(s.esClient, indexName, limit, offset)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -647,9 +671,9 @@ func (s *Server) listDocuments(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
-// deleteDocument removes a document by ID.
+// deleteDocument removes a document by ID. Admin operation: uses raw ES client.
 func (s *Server) deleteDocument(c *gin.Context) {
-	_, indexName, err := s.resolveKB(c)
+	_, indexName, err := s.resolveKB(c, nil)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
@@ -661,25 +685,24 @@ func (s *Server) deleteDocument(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "document_id is required"})
 		return
 	}
-	if err := s.esIndexer.DeleteDocument(indexName, req.DocumentID); err != nil {
+	if err := rag.AdminDeleteDocument(s.esClient, indexName, req.DocumentID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
-	// Invalidate cache for this collection
 	if s.retrievalCache != nil {
 		s.retrievalCache.InvalidateScope(indexName)
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Document deleted successfully"})
 }
 
-// listFiles returns aggregated file information.
+// listFiles returns aggregated file information. Admin operation.
 func (s *Server) listFiles(c *gin.Context) {
-	_, indexName, err := s.resolveKB(c)
+	_, indexName, err := s.resolveKB(c, nil)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
-	files, err := s.esIndexer.ListFiles(indexName)
+	files, err := rag.AdminListFiles(s.esClient, indexName)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -687,9 +710,9 @@ func (s *Server) listFiles(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"files": files})
 }
 
-// deleteFile removes all chunks for a filename.
+// deleteFile removes all chunks for a filename. Admin operation.
 func (s *Server) deleteFile(c *gin.Context) {
-	_, indexName, err := s.resolveKB(c)
+	_, indexName, err := s.resolveKB(c, nil)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
@@ -701,11 +724,10 @@ func (s *Server) deleteFile(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "filename is required"})
 		return
 	}
-	if err := s.esIndexer.DeleteFile(indexName, req.Filename); err != nil {
+	if err := rag.AdminDeleteFile(s.esClient, indexName, req.Filename); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
-	// Invalidate cache for this collection
 	if s.retrievalCache != nil {
 		s.retrievalCache.InvalidateScope(indexName)
 	}
@@ -768,9 +790,9 @@ func (s *Server) createKnowledgeBase(c *gin.Context) {
 	}
 
 	// Ensure ES index for the new KB (non-fatal on failure)
-	if s.esIndexer != nil && s.embedDims > 0 {
+	if s.kbIndexer != nil {
 		indexName := kb.IndexName()
-		if err := s.esIndexer.EnsureIndexForKB(c.Request.Context(), indexName, s.embedDims); err != nil {
+		if err := s.kbIndexer.EnsureIndexForKB(c.Request.Context(), indexName); err != nil {
 			log.Printf("WARNING: Failed to create ES index %s for KB %d: %v", indexName, kb.ID, err)
 		}
 	}
@@ -793,9 +815,14 @@ func (s *Server) listCollections(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"collections": names})
 }
 
+// addDocument writes a document to the resolved KB's index. Per-request
+// BuildIndexChainAt compile captures indexName in a closure; the underlying
+// KBIndexer.Store is invoked with WithIndex(indexName) so chunks land in
+// the right ES index.
 func (s *Server) addDocument(c *gin.Context) {
 	var req struct {
 		Content string `json:"content"`
+		KBID    *int64 `json:"kb_id,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
@@ -813,11 +840,21 @@ func (s *Server) addDocument(c *gin.Context) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": d.Reason})
 		return
 	}
-	// Write content to temp file for Chain
-	if s.chain == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "index chain not configured"})
+
+	if s.kbIndexer == nil || s.splitter == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "indexer not configured"})
 		return
 	}
+
+	// Resolve KB. Body's req.KBID takes precedence over query ?kb_id=.
+	// resolveKB handles both: pass req.KBID (may be nil if neither set).
+	_, indexName, err := s.resolveKB(c, req.KBID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+
+	// Write content to temp file for the FileLoader
 	tmpFile, err := os.CreateTemp("", "mcp-rag-doc-*.txt")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
@@ -832,7 +869,13 @@ func (s *Server) addDocument(c *gin.Context) {
 	}
 	tmpFile.Close()
 
-	ids, err := s.chain.Invoke(c.Request.Context(), document.Source{URI: tmpPath})
+	// Per-request compile + invoke
+	runnable, err := rag.BuildIndexChainAt(c.Request.Context(), s.splitter, s.kbIndexer, indexName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": fmt.Sprintf("build chain: %v", err)})
+		return
+	}
+	ids, err := runnable.Invoke(c.Request.Context(), document.Source{URI: tmpPath})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -840,12 +883,12 @@ func (s *Server) addDocument(c *gin.Context) {
 
 	docID := ""
 	if len(ids) > 0 {
-		docID = ids[0] // Use first chunk ID as document reference
+		docID = ids[0]
 	}
 
-	// Invalidate cache for the index the chain actually wrote to
-	if s.retrievalCache != nil && s.esIndexer != nil {
-		s.retrievalCache.InvalidateScope(s.esIndexer.IndexName())
+	// Invalidate cache for the index we actually wrote to
+	if s.retrievalCache != nil {
+		s.retrievalCache.InvalidateScope(indexName)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -855,7 +898,9 @@ func (s *Server) addDocument(c *gin.Context) {
 	})
 }
 
-// uploadFiles handles multipart file upload and indexing.
+// uploadFiles handles multipart file upload and indexing. Each file is
+// indexed via a per-request BuildIndexChainAt compile that closes over
+// the resolved indexName.
 func (s *Server) uploadFiles(c *gin.Context) {
 	form, err := c.MultipartForm()
 	if err != nil {
@@ -884,6 +929,18 @@ func (s *Server) uploadFiles(c *gin.Context) {
 		return
 	}
 
+	// Resolve the target KB once for the entire batch
+	_, indexName, err := s.resolveKB(c, nil)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+
+	if s.kbIndexer == nil || s.splitter == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "indexer not configured"})
+		return
+	}
+
 	type fileResult struct {
 		Filename      string `json:"filename"`
 		FileType      string `json:"file_type"`
@@ -906,8 +963,14 @@ func (s *Server) uploadFiles(c *gin.Context) {
 			continue
 		}
 
-		// Index via Chain
-		_, err = s.chain.Invoke(c.Request.Context(), document.Source{URI: tmpPath})
+		// Per-request compile + invoke
+		runnable, err := rag.BuildIndexChainAt(c.Request.Context(), s.splitter, s.kbIndexer, indexName)
+		if err != nil {
+			os.Remove(tmpPath)
+			results = append(results, fileResult{Filename: fh.Filename, ContentLength: fh.Size, Error: err.Error()})
+			continue
+		}
+		_, err = runnable.Invoke(c.Request.Context(), document.Source{URI: tmpPath})
 		os.Remove(tmpPath)
 		if err != nil {
 			results = append(results, fileResult{Filename: fh.Filename, ContentLength: fh.Size, Error: err.Error()})
@@ -917,9 +980,9 @@ func (s *Server) uploadFiles(c *gin.Context) {
 		results = append(results, fileResult{Filename: fh.Filename, ContentLength: fh.Size, Processed: true})
 	}
 
-	// Invalidate cache for the index the chain actually wrote to
-	if s.retrievalCache != nil && s.esIndexer != nil {
-		s.retrievalCache.InvalidateScope(s.esIndexer.IndexName())
+	// Invalidate cache for the resolved index once
+	if s.retrievalCache != nil {
+		s.retrievalCache.InvalidateScope(indexName)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -930,7 +993,72 @@ func (s *Server) uploadFiles(c *gin.Context) {
 	})
 }
 
-// search performs vector similarity search.
+// searchRawHit is a flat JSON representation of a single search result
+// returned to HTTP and MCP clients. It is used by both /search and
+// /chat responses, and is built from per-KB retriever outputs.
+type searchRawHit struct {
+	Content         string  `json:"content"`
+	Score           float64 `json:"score"`
+	Source          string  `json:"source"`
+	Filename        string  `json:"filename"`
+	ChunkID         string  `json:"chunk_id"`
+	DocumentID      string  `json:"document_id"`
+	ChunkIndex      int     `json:"chunk_index"`
+	VectorScore     float64 `json:"vector_score,omitempty"`
+	KeywordScore    float64 `json:"keyword_score,omitempty"`
+	RetrievalMethod string  `json:"retrieval_method,omitempty"`
+	Metadata        gin.H   `json:"metadata,omitempty"`
+}
+
+// docsToHits converts a slice of eino *schema.Document to the flat
+// searchRawHit form. score falls back to whatever the result parser
+// placed in MetaData["score"].
+func docsToHits(docs []*rag.RetrievedDoc) []searchRawHit {
+	out := make([]searchRawHit, 0, len(docs))
+	for _, d := range docs {
+		var score float64
+		if v, ok := d.MetaData["score"]; ok {
+			score, _ = v.(float64)
+		}
+		var filename, source, chunkID, documentID string
+		var chunkIndex int
+		if v, ok := d.MetaData["filename"].(string); ok {
+			filename = v
+		}
+		if v, ok := d.MetaData["source"].(string); ok {
+			source = v
+		}
+		if v, ok := d.MetaData["chunk_id"].(string); ok {
+			chunkID = v
+		}
+		if v, ok := d.MetaData["document_id"].(string); ok {
+			documentID = v
+		}
+		if v, ok := d.MetaData["chunk_index"]; ok {
+			switch n := v.(type) {
+			case int:
+				chunkIndex = n
+			case float64:
+				chunkIndex = int(n)
+			}
+		}
+		out = append(out, searchRawHit{
+			Content:    d.Content,
+			Score:      score,
+			Source:     source,
+			Filename:   filename,
+			ChunkID:    chunkID,
+			DocumentID: documentID,
+			ChunkIndex: chunkIndex,
+		})
+	}
+	return out
+}
+
+// search handles /search. Resolves KB, then runs a per-request
+// BuildRetrievalGraphAt compile with closure-captured indexName. We
+// use the same graph as chat but stop after the retrieve node to skip
+// the LLM step (use the docs directly).
 func (s *Server) search(c *gin.Context) {
 	query := c.Query("query")
 	if query == "" {
@@ -945,12 +1073,11 @@ func (s *Server) search(c *gin.Context) {
 		}
 	}
 
-	// Check for kb_ids (multi-KB aggregation)
+	// Multi-KB aggregation
 	kbIDsRaw := c.Query("kb_ids")
 	if kbIDsRaw == "" {
-		kbIDsRaw = c.Query("kb_ids[]") // query array style
+		kbIDsRaw = c.Query("kb_ids[]")
 	}
-
 	var kbIDs []int64
 	if kbIDsRaw != "" {
 		for _, part := range strings.Split(kbIDsRaw, ",") {
@@ -966,14 +1093,14 @@ func (s *Server) search(c *gin.Context) {
 		return
 	}
 
-	// Resolve KB
-	resolution, indexName, err := s.resolveKB(c)
+	// Single KB
+	resolution, indexName, err := s.resolveKB(c, nil)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
 
-	// Check cache first
+	// Cache check
 	if s.retrievalCache != nil {
 		cacheKey := rag.RetrievalCacheKey{
 			Collection: indexName,
@@ -988,64 +1115,43 @@ func (s *Server) search(c *gin.Context) {
 		}
 	}
 
-	// Embed the query
-	vecs, err := s.embedder.EmbedStrings(c.Request.Context(), []string{query})
+	// Per-request compile + retrieve (no LLM)
+	docs, err := s.retrieveAt(c.Request.Context(), s.kbRetriever, indexName, query, limit, s.cfg.MinScore, s.cfg.SearchMode)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
 
-	// Search with configured mode (hybrid/rrf/knn)
-	hits, err := s.searcher.SearchWithMode(c.Request.Context(), query, toFloat32(vecs[0]), limit, s.cfg.MinScore, s.cfg.SearchMode)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
-		return
-	}
-
-	// Format response compatible with Python MCP-RAG
-	results := make([]gin.H, 0, len(hits))
-	for _, h := range hits {
-		result := gin.H{
-			"content":  h.Content,
-			"score":    h.Score,
-			"source":   h.Source,
-			"filename": h.Filename,
+	hits := docsToHits(docs)
+	for i := range hits {
+		method := s.cfg.SearchMode
+		if method == "hybrid" || method == "rrf" {
+			hits[i].VectorScore = hits[i].Score
+			hits[i].KeywordScore = hits[i].Score
+			hits[i].RetrievalMethod = "hybrid"
+		} else if method == "knn" {
+			hits[i].VectorScore = hits[i].Score
+			hits[i].KeywordScore = 0
+			hits[i].RetrievalMethod = "vector"
+		} else {
+			hits[i].VectorScore = hits[i].Score
+			hits[i].RetrievalMethod = method
 		}
-
-		// Enriched metadata with KB info
-		metadata := gin.H{}
 		if resolution != nil {
-			metadata["knowledge_base_id"] = resolution.KnowledgeBase.ID
-			metadata["knowledge_base_name"] = resolution.KnowledgeBase.Name
-			metadata["knowledge_base_scope"] = resolution.KnowledgeBase.Scope
+			hits[i].Metadata = gin.H{
+				"knowledge_base_id":    resolution.KnowledgeBase.ID,
+				"knowledge_base_name":  resolution.KnowledgeBase.Name,
+				"knowledge_base_scope": resolution.KnowledgeBase.Scope,
+			}
 		}
-		result["metadata"] = metadata
-
-		// Vector/keyword score and retrieval method
-		switch s.cfg.SearchMode {
-		case "hybrid", "rrf":
-			result["vector_score"] = h.Score
-			result["keyword_score"] = h.Score
-			result["retrieval_method"] = "hybrid"
-		case "knn":
-			result["vector_score"] = h.Score
-			result["keyword_score"] = 0.0
-			result["retrieval_method"] = "vector"
-		default:
-			result["vector_score"] = h.Score
-			result["retrieval_method"] = s.cfg.SearchMode
-		}
-
-		results = append(results, result)
 	}
 
 	searchResp := gin.H{
 		"query":      query,
 		"collection": indexName,
-		"results":    results,
+		"results":    hits,
 	}
 
-	// Store in cache
 	if s.retrievalCache != nil {
 		cacheKey := rag.RetrievalCacheKey{
 			Collection: indexName,
@@ -1054,8 +1160,18 @@ func (s *Server) search(c *gin.Context) {
 			Limit:      limit,
 			Threshold:  s.cfg.MinScore,
 		}
-		searchHits := make([]rag.SearchHit, len(hits))
-		copy(searchHits, hits)
+		searchHits := make([]rag.SearchHit, 0, len(hits))
+		for _, h := range hits {
+			searchHits = append(searchHits, rag.SearchHit{
+				Content:    h.Content,
+				Score:      h.Score,
+				Source:     h.Source,
+				Filename:   h.Filename,
+				ChunkID:    h.ChunkID,
+				DocumentID: h.DocumentID,
+				ChunkIndex: h.ChunkIndex,
+			})
+		}
 		s.retrievalCache.Set(cacheKey, &rag.SearchResponse{
 			Query:      query,
 			Collection: indexName,
@@ -1066,21 +1182,22 @@ func (s *Server) search(c *gin.Context) {
 	c.JSON(http.StatusOK, searchResp)
 }
 
-// searchMultiKB performs parallel search across multiple knowledge bases and aggregates results.
+// searchMultiKB performs parallel search across multiple KBs. Each
+// goroutine builds its own per-request compiled retriever, queries
+// its own ES index, and the results are merged.
 func (s *Server) searchMultiKB(c *gin.Context, query string, kbIDs []int64, limit int) {
 	ctx := c.Request.Context()
 
-	// Resolve each kb_id to index name, dedupe by index
 	type kbInfo struct {
-		kb           *knowledgebase.KnowledgeBase
-		indexName    string
+		kb        *knowledgebase.KnowledgeBase
+		indexName string
 	}
 	seen := map[string]bool{}
 	var kbs []kbInfo
 	for _, id := range kbIDs {
 		resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{KBID: &id})
 		if err != nil {
-			continue // skip unresolvable KBs
+			continue
 		}
 		indexName := resolution.KnowledgeBase.IndexName()
 		if seen[indexName] {
@@ -1095,18 +1212,8 @@ func (s *Server) searchMultiKB(c *gin.Context, query string, kbIDs []int64, limi
 		return
 	}
 
-	// Embed query once
-	vecs, err := s.embedder.EmbedStrings(ctx, []string{query})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
-		return
-	}
-	queryVec := toFloat32(vecs[0])
-
-	// Parallel search (max 10 goroutines)
 	type searchResult struct {
-		idx  int
-		hits []rag.SearchHit
+		docs []*rag.RetrievedDoc
 		err  error
 	}
 	results := make([]searchResult, len(kbs))
@@ -1119,73 +1226,112 @@ func (s *Server) searchMultiKB(c *gin.Context, query string, kbIDs []int64, limi
 
 	for i, kb := range kbs {
 		wg.Add(1)
-		go func(idx int, idxName string, info kbInfo) {
+		go func(idx int, idxName string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			hits, err := s.searchWithClassifier(ctx, query, queryVec, limit, s.cfg.MinScore, s.cfg.SearchMode)
-			results[idx] = searchResult{idx: idx, hits: hits, err: err}
-		}(i, kb.indexName, kb)
+			docs, err := s.retrieveAt(ctx, s.kbRetriever, idxName, query, limit, s.cfg.MinScore, s.cfg.SearchMode)
+			results[idx] = searchResult{docs: docs, err: err}
+		}(i, kb.indexName)
 	}
 	wg.Wait()
 
-	// Collect results
-	var kbResults []rag.KBSearchResult
+	var merged []searchRawHit
 	for i, info := range kbs {
 		r := results[i]
 		if r.err != nil {
 			continue
 		}
-		var ownerUserID, ownerAgentID *int64
-		if info.kb.OwnerUserID != nil {
-			v := *info.kb.OwnerUserID
-			ownerUserID = &v
+		hits := docsToHits(r.docs)
+		for j := range hits {
+			hits[j].RetrievalMethod = s.cfg.SearchMode
+			if hits[j].RetrievalMethod == "hybrid" || hits[j].RetrievalMethod == "rrf" {
+				hits[j].VectorScore = hits[j].Score
+				hits[j].KeywordScore = hits[j].Score
+			} else {
+				hits[j].VectorScore = hits[j].Score
+			}
+			hits[j].Metadata = gin.H{
+				"knowledge_base_id":    info.kb.ID,
+				"knowledge_base_name":  info.kb.Name,
+				"knowledge_base_scope": info.kb.Scope,
+			}
 		}
-		if info.kb.OwnerAgentID != nil {
-			v := *info.kb.OwnerAgentID
-			ownerAgentID = &v
-		}
-		kbResults = append(kbResults, rag.KBSearchResult{
-			KBID:         info.kb.ID,
-			KBName:       info.kb.Name,
-			KBScope:      string(info.kb.Scope),
-			OwnerUserID:  ownerUserID,
-			OwnerAgentID: ownerAgentID,
-			Hits:         r.hits,
-		})
+		merged = append(merged, hits...)
 	}
 
-	aggregated := rag.AggregateResults(kbResults, limit)
-
-	// Convert to gin.H for JSON
-	ginResults := make([]gin.H, len(aggregated))
-	for i, ar := range aggregated {
-		ginResults[i] = gin.H{
-			"content":          ar.Content,
-			"score":            ar.Score,
-			"source":           ar.Source,
-			"filename":         ar.Filename,
-			"metadata": gin.H{
-				"knowledge_base_id":    ar.KBID,
-				"knowledge_base_name":  ar.KBName,
-				"knowledge_base_scope": ar.KBScope,
-				"owner_user_id":        ar.OwnerUserID,
-				"owner_agent_id":       ar.OwnerAgentID,
-			},
-			"vector_score":     ar.VectorScore,
-			"keyword_score":    ar.KeywordScore,
-			"retrieval_method": ar.RetrievalMethod,
-		}
+	// Sort by score desc and truncate
+	sortHitsByScore(merged)
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"query":      query,
 		"collection": "multi_kb",
-		"results":    ginResults,
+		"results":    merged,
 	})
 }
 
-// chat handles RAG-based conversation.
+func sortHitsByScore(hits []searchRawHit) {
+	// Simple insertion sort; n is small (limit=5..20)
+	for i := 1; i < len(hits); i++ {
+		for j := i; j > 0 && hits[j-1].Score < hits[j].Score; j-- {
+			hits[j-1], hits[j] = hits[j], hits[j-1]
+		}
+	}
+}
+
+// retrieveAt runs a per-request compiled retriever for the given KB index
+// and returns the raw *rag.RetrievedDoc slice. Used by /search and
+// /chat to do the retrieve step only; LLM generation is handled by
+// chat after this returns.
+// retrieveAt performs a search against the per-request indexName. The
+// eino-ext retriever is configured with SearchModeRawStringRequest, which
+// expects the query argument to be a complete ES query body JSON (NOT
+// plain text). So before calling kr.Retrieve we must:
+//  1. Embed the user's text query via s.embedder to get the dense vector
+//  2. Build the hybrid/knn/keyword ES body via rag.BuildHybridQueryJSON
+//  3. Hand that JSON body to kr.Retrieve as the "query" argument
+//
+// searchMode drives the body shape (hybrid/knn/rrf/keyword); topK and
+// minScore are passed through; weights default to rag.DefaultWeights.
+func (s *Server) retrieveAt(ctx context.Context, kr retriever.Retriever, indexName, query string, topK int, minScore float64, searchMode string) ([]*rag.RetrievedDoc, error) {
+	if kr == nil {
+		return nil, fmt.Errorf("retrieveAt: nil kbRetriever")
+	}
+	if s.embedder == nil {
+		return nil, fmt.Errorf("retrieveAt: nil embedder (cannot build hybrid query JSON)")
+	}
+
+	// 1. Embed the text query → dense vector.
+	vectors, err := s.embedder.EmbedStrings(ctx, []string{query})
+	if err != nil {
+		return nil, fmt.Errorf("retrieveAt: embed query: %w", err)
+	}
+	if len(vectors) == 0 || len(vectors[0]) == 0 {
+		return nil, fmt.Errorf("retrieveAt: embedder returned empty vector")
+	}
+	vector := vectors[0]
+
+	// 2. Build the ES query body JSON.
+	body, err := rag.BuildHybridQueryJSON(query, vector, topK, minScore, rag.DefaultWeights, searchMode)
+	if err != nil {
+		return nil, fmt.Errorf("retrieveAt: build query body: %w", err)
+	}
+
+	// 3. Hand the JSON body to eino-ext retriever. WithIndex closes over
+	// the per-request indexName inside the wrapper.
+	docs, err := kr.Retrieve(ctx, body, rag.WithIndexOpt(indexName), rag.WithTopKOpt(topK), rag.WithMinScoreOpt(minScore))
+	if err != nil {
+		return nil, err
+	}
+	return docs, nil
+}
+
+// chat handles /chat. Single-KB: builds a per-request
+// BuildRetrievalGraphAt with closure-captured indexName and invokes
+// the full retrieve+LLM pipeline. Multi-KB: delegates to chatMultiKB.
 func (s *Server) chat(c *gin.Context) {
 	var req rag.ChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1197,39 +1343,54 @@ func (s *Server) chat(c *gin.Context) {
 		return
 	}
 
-	// Multi-KB mode
 	if len(req.KBIDs) > 0 {
 		s.chatMultiKB(c, &req)
 		return
 	}
 
-	// Resolve KB from request fields
-	if req.KBID != nil || req.Scope != "" || req.Collection != "" {
-		resolution, indexName, err := s.resolveKBFromChat(&req)
-		if err == nil {
-			req.Collection = indexName
-			_ = resolution
-		}
+	// Resolve KB (allow body-supplied kb_id to take precedence)
+	if req.KBID == nil {
+		req.KBID = parseIntPtr(c.Query("kb_id"))
+	}
+	_, indexName, err := s.resolveKBFromChat(&req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
 	}
 
-	resp, err := s.chatSvc.Chat(c.Request.Context(), &req)
+	limit := req.Limit
+	if limit <= 0 {
+		limit = s.cfg.TopK
+	}
+
+	runnable, err := rag.BuildRetrievalGraphAt(c.Request.Context(), s.kbRetriever, s.llm, s.embedder, indexName, s.cfg.SearchMode, limit, s.cfg.MinScore)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": fmt.Sprintf("build graph: %v", err)})
+		return
+	}
+	answer, err := runnable.Invoke(c.Request.Context(), req.Query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, gin.H{
+		"query":      req.Query,
+		"collection": indexName,
+		"response":   answer,
+		"sources":    []any{},
+	})
 }
 
-// chatMultiKB handles chat requests across multiple KBs.
+// chatMultiKB runs per-KB BuildRetrievalGraphAt compiles in parallel
+// goroutines. Each goroutine produces an answer for its own ES index;
+// answers are concatenated and a final LLM call combines them.
 func (s *Server) chatMultiKB(c *gin.Context, req *rag.ChatRequest) {
-	// Use the multi-KB search helper
 	limit := req.Limit
 	if limit <= 0 {
-		limit = 5
+		limit = s.cfg.TopK
 	}
 
-	// Resolve KBs
 	type kbInfo struct {
 		kb        *knowledgebase.KnowledgeBase
 		indexName string
@@ -1254,76 +1415,65 @@ func (s *Server) chatMultiKB(c *gin.Context, req *rag.ChatRequest) {
 		return
 	}
 
-	// Embed once
-	vecs, err := s.embedder.EmbedStrings(c.Request.Context(), []string{req.Query})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
-		return
+	type chatResult struct {
+		kbName string
+		answer string
+		err    error
 	}
-	queryVec := toFloat32(vecs[0])
-
-	// Parallel search
-	type searchResult struct {
-		hits []rag.SearchHit
-		err  error
-	}
-	results := make([]searchResult, len(kbs))
+	results := make([]chatResult, len(kbs))
 	var wg sync.WaitGroup
 	for i, kb := range kbs {
 		wg.Add(1)
 		go func(idx int, info kbInfo) {
 			defer wg.Done()
-			hits, err := s.searchWithClassifier(c.Request.Context(), req.Query, queryVec, limit, s.cfg.MinScore, s.cfg.SearchMode)
-			results[idx] = searchResult{hits: hits, err: err}
+			runnable, err := rag.BuildRetrievalGraphAt(c.Request.Context(), s.kbRetriever, s.llm, s.embedder, info.indexName, s.cfg.SearchMode, limit, s.cfg.MinScore)
+			if err != nil {
+				results[idx] = chatResult{kbName: info.kb.Name, err: err}
+				return
+			}
+			answer, err := runnable.Invoke(c.Request.Context(), req.Query)
+			results[idx] = chatResult{kbName: info.kb.Name, answer: answer, err: err}
 		}(i, kb)
 	}
 	wg.Wait()
 
-	// Collect and aggregate
-	var kbResults []rag.KBSearchResult
-	for i, info := range kbs {
-		r := results[i]
-		if r.err != nil {
+	// Combine per-KB answers via a final LLM call (or join if LLM unavailable)
+	var b strings.Builder
+	collected := 0
+	for _, r := range results {
+		if r.err != nil || r.answer == "" {
 			continue
 		}
-		kbResults = append(kbResults, rag.KBSearchResult{
-			KBID:         info.kb.ID,
-			KBName:       info.kb.Name,
-			KBScope:      string(info.kb.Scope),
-			OwnerUserID:  info.kb.OwnerUserID,
-			OwnerAgentID: info.kb.OwnerAgentID,
-			Hits:         r.hits,
+		if collected > 0 {
+			b.WriteString("\n\n")
+		}
+		fmt.Fprintf(&b, "## %s\n\n%s", r.kbName, r.answer)
+		collected++
+	}
+
+	var finalAnswer string
+	if collected == 0 {
+		finalAnswer = "未找到相关信息。"
+	} else if collected == 1 {
+		finalAnswer = b.String()
+	} else {
+		// Use LLM to combine
+		combined, err := s.llm.Generate(c.Request.Context(), []*rag.EinoMessage{
+			{Role: "user", Content: fmt.Sprintf("基于以下多知识库答案，给出一个综合回答：\n\n%s", b.String())},
 		})
+		if err != nil || combined == nil {
+			finalAnswer = b.String()
+		} else {
+			finalAnswer = combined.Content
+		}
 	}
 
-	if len(kbResults) == 0 {
-		c.JSON(http.StatusOK, rag.ChatResponse{
-			Query:      req.Query,
-			Collection: "multi_kb",
-			Response:   "未找到相关信息。",
-		})
-		return
-	}
-
-	// Build merged context for LLM
-	aggregated := rag.AggregateResults(kbResults, limit)
-	var contextBuilder strings.Builder
-	for idx, ar := range aggregated {
-		contextBuilder.WriteString(fmt.Sprintf("文档%d (相似度: %.3f, 知识库: %s):\n%s\n\n",
-			idx+1, ar.Score, ar.KBName, ar.Content))
-	}
-
-	// Call LLM with pre-built context
-	req.PreRetrievedContext = contextBuilder.String()
-	req.Collection = "multi_kb"
-	resp, err := s.chatSvc.Chat(c.Request.Context(), req)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
-		return
-	}
-	resp.Collection = "multi_kb"
-
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, gin.H{
+		"query":      req.Query,
+		"collection": "multi_kb",
+		"response":   finalAnswer,
+		"sources":    []any{},
+	})
 }
 
 // resolveKBFromChat resolves KB from ChatRequest fields.
@@ -1386,16 +1536,4 @@ func toFloat32(f64 []float64) []float32 {
 		result[i] = float32(v)
 	}
 	return result
-}
-
-// searchWithClassifier performs search with adaptive weights from the query classifier.
-// When searchMode is "hybrid", it classifies the query and uses intent-aware weights.
-// For "knn" and "rrf" modes, weights are ignored.
-func (s *Server) searchWithClassifier(ctx context.Context, query string, vec []float32, topK int, minScore float64, mode string) ([]rag.SearchHit, error) {
-	if mode == "hybrid" && s.classifier != nil {
-		classification := s.classifier.Classify(query)
-		weights := rag.GetWeights(classification.PrimaryIntent)
-		return s.searcher.SearchWithWeights(ctx, query, vec, topK, minScore, mode, weights)
-	}
-	return s.searcher.SearchWithMode(ctx, query, vec, topK, minScore, mode)
 }

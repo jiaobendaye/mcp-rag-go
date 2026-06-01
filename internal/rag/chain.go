@@ -2,61 +2,65 @@ package rag
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cloudwego/eino/components/document"
-	"github.com/cloudwego/eino/components/embedding"
-	"github.com/cloudwego/eino/components/indexer"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/cloudwego/eino-ext/components/document/loader/file"
-	"github.com/cloudwego/eino-ext/components/document/transformer/splitter/recursive"
 )
 
-// BuildIndexChain creates an eino compose.Chain for document indexing.
+// BuildIndexChainAt returns a compose.Runnable that writes the indexed
+// chunks to the given ES index. Per-request compile: each call rebuilds
+// a fresh chain with a `writeAt` lambda that closes over indexName, so
+// the KBIndexer.Store call inside the lambda receives WithIndex(indexName).
 //
-//	Source → Loader → Splitter → [extract text + embed] → Indexer
+// The chain topology is:
 //
-// The Lambda bridges the gap between Splitter ([]*schema.Document) and
-// Indexer ([]*schema.Document), injecting the embedding vectors.
-func BuildIndexChain(ctx context.Context, emb embedding.Embedder, idx indexer.Indexer, chunkSize, overlap int) (compose.Runnable[document.Source, []string], error) {
-	loader, err := file.NewFileLoader(ctx, &file.FileLoaderConfig{})
-	if err != nil {
-		return nil, err
+//	Source → FileLoader → RecursiveSplitter → Lambda(writeAt)
+//
+// The eino-ext KBIndexer handles embedding internally — DocumentToFields
+// returns EmbedKey: "content_vector" on the content field, so eino-ext's
+// bulkAdd calls Embedding.EmbedStrings for us. We don't need an explicit
+// embed lambda in the chain.
+//
+// Per-request Compile cost is sub-ms for a 3-node linear graph.
+func BuildIndexChainAt(
+	ctx context.Context,
+	splitter document.Transformer,
+	kbIndexer *KBIndexer,
+	indexName string,
+) (compose.Runnable[document.Source, []string], error) {
+	if indexName == "" {
+		return nil, fmt.Errorf("BuildIndexChainAt: empty indexName")
 	}
-	splitter, err := recursive.NewSplitter(ctx, &recursive.Config{
-		ChunkSize:   chunkSize,
-		OverlapSize: overlap,
-	})
-	if err != nil {
-		return nil, err
+	if kbIndexer == nil {
+		return nil, fmt.Errorf("BuildIndexChainAt: nil kbIndexer")
+	}
+	if splitter == nil {
+		return nil, fmt.Errorf("BuildIndexChainAt: nil splitter")
 	}
 
-	// Lambda: embed text and attach vectors to documents
-	embedDocs := compose.InvokableLambda(func(ctx context.Context, docs []*schema.Document) ([]*schema.Document, error) {
-		texts := make([]string, len(docs))
-		for i, d := range docs {
-			texts[i] = d.Content
-		}
-		vecs, err := emb.EmbedStrings(ctx, texts)
-		if err != nil {
-			return nil, err
-		}
-		for i, v := range vecs {
-			if docs[i].MetaData == nil {
-				docs[i].MetaData = make(map[string]any)
-			}
-			docs[i].MetaData["_embedding"] = v
-		}
-		return docs, nil
+	loader, err := file.NewFileLoader(ctx, &file.FileLoaderConfig{})
+	if err != nil {
+		return nil, fmt.Errorf("BuildIndexChainAt: create loader: %w", err)
+	}
+
+	// Lambda closes over indexName — the per-request state.
+	writeAt := compose.InvokableLambda(func(ctx context.Context, docs []*schema.Document) ([]string, error) {
+		return kbIndexer.Store(ctx, docs, WithIndex(indexName))
 	})
 
 	chain := compose.NewChain[document.Source, []string]()
 	chain.
 		AppendLoader(loader).
 		AppendDocumentTransformer(splitter).
-		AppendLambda(embedDocs).
-		AppendIndexer(idx)
+		AppendLambda(writeAt)
 
-	return chain.Compile(ctx)
+	runnable, err := chain.Compile(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("BuildIndexChainAt: compile: %w", err)
+	}
+	return runnable, nil
 }

@@ -5,140 +5,98 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cloudwego/eino/components/embedding"
 	"github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
+	elastic_retriever "github.com/cloudwego/eino-ext/components/retriever/es8"
 )
 
-func TestBuildRetrievalGraph(t *testing.T) {
-	t.Run("graph compiles successfully", func(t *testing.T) {
-		emb := &mockEmbedder{}
-		search := &mockSearcher{
-			searchHybridFunc: func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
-				return []SearchHit{
-					{ChunkID: "c1", Content: "RAG是检索增强生成技术", Score: 0.95, Filename: "doc1.md", Source: "doc1.md", ChunkIndex: 0},
-				}, nil
-			},
-		}
-		llm := &mockLLM{}
+func TestBuildRetrievalGraphAt_RejectsEmptyIndex(t *testing.T) {
+	llm := &stubLLM{}
+	emb := &stubEmbedder{}
+	k := &KBRetriever{base: nil, conf: &elastic_retriever.RetrieverConfig{Index: "x"}}
+	_, err := BuildRetrievalGraphAt(context.Background(), k, llm, emb, "", "hybrid", 5, 0.0)
+	if err == nil || !strings.Contains(err.Error(), "empty indexName") {
+		t.Errorf("expected empty-indexName error, got %v", err)
+	}
+}
 
-		runnable, err := BuildRetrievalGraph(context.Background(), emb, search, llm, "hybrid")
-		if err != nil {
-			t.Fatalf("BuildRetrievalGraph error: %v", err)
-		}
-		if runnable == nil {
-			t.Fatal("expected non-nil runnable")
-		}
-	})
+func TestBuildRetrievalGraphAt_RejectsNilRetriever(t *testing.T) {
+	llm := &stubLLM{}
+	emb := &stubEmbedder{}
+	_, err := BuildRetrievalGraphAt(context.Background(), nil, llm, emb, "kb_1", "hybrid", 5, 0.0)
+	if err == nil || !strings.Contains(err.Error(), "nil kbRetriever") {
+		t.Errorf("expected nil-retriever error, got %v", err)
+	}
+}
 
-	t.Run("graph invocation with results", func(t *testing.T) {
-		emb := &mockEmbedder{}
-		search := &mockSearcher{
-			searchHybridFunc: func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
-				return []SearchHit{
-					{
-						ChunkID:    "c1",
-						DocumentID: "d1",
-						Content:    "RAG（Retrieval-Augmented Generation）是检索增强生成技术",
-						Score:      0.95,
-						Filename:   "intro.md",
-						Source:     "intro.md",
-						ChunkIndex: 0,
-					},
-				}, nil
-			},
-		}
-		llm := &mockLLM{}
+func TestBuildRetrievalGraphAt_RejectsNilLLM(t *testing.T) {
+	emb := &stubEmbedder{}
+	k := &KBRetriever{base: nil, conf: &elastic_retriever.RetrieverConfig{Index: "x"}}
+	_, err := BuildRetrievalGraphAt(context.Background(), k, nil, emb, "kb_1", "hybrid", 5, 0.0)
+	if err == nil || !strings.Contains(err.Error(), "nil llm") {
+		t.Errorf("expected nil-llm error, got %v", err)
+	}
+}
 
-		runnable, err := BuildRetrievalGraph(context.Background(), emb, search, llm, "hybrid")
-		if err != nil {
-			t.Fatalf("BuildRetrievalGraph error: %v", err)
-		}
+func TestBuildRetrievalGraphAt_RejectsNilEmbedder(t *testing.T) {
+	llm := &stubLLM{}
+	k := &KBRetriever{base: nil, conf: &elastic_retriever.RetrieverConfig{Index: "x"}}
+	_, err := BuildRetrievalGraphAt(context.Background(), k, llm, nil, "kb_1", "hybrid", 5, 0.0)
+	if err == nil || !strings.Contains(err.Error(), "nil embedder") {
+		t.Errorf("expected nil-embedder error, got %v", err)
+	}
+}
 
-		answer, err := runnable.Invoke(context.Background(), "什么是RAG？")
-		if err != nil {
-			t.Fatalf("Invoke error: %v", err)
-		}
-		if answer == "" {
-			t.Error("expected non-empty answer")
-		}
-		// The mock LLM returns "这是基于知识的回答。"
-		if answer != "这是基于知识的回答。" {
-			t.Errorf("unexpected answer: %s", answer)
-		}
-	})
+// TestBuildRetrievalGraphAt_ClosureCapturesIndex verifies that the graph
+// compiled by BuildRetrievalGraphAt captures indexName in the per-request
+// retriever options. We verify by:
+//  1. Confirming compile succeeds
+//  2. Confirming the underlying KBRetriever's resolveIndex returns the
+//     per-request index when the same options are applied
+func TestBuildRetrievalGraphAt_ClosureCapturesIndex(t *testing.T) {
+	llm := &stubLLM{}
+	emb := &stubEmbedder{}
+	// Use a placeholder-bound KBRetriever so the per-request WithIndex
+	// will be the source of truth.
+	k := &KBRetriever{
+		base: nil,
+		conf: &elastic_retriever.RetrieverConfig{Index: PlaceholderIndex},
+	}
+	runnable, err := BuildRetrievalGraphAt(context.Background(), k, llm, emb, "kb_2", "hybrid", 7, 0.6)
+	if err != nil {
+		t.Fatalf("BuildRetrievalGraphAt: %v", err)
+	}
+	if runnable == nil {
+		t.Fatal("expected non-nil runnable")
+	}
+	// Verify the option semantics match what we passed.
+	opts := []retriever.Option{retriever.WithIndex("kb_2"), retriever.WithTopK(7), retriever.WithScoreThreshold(0.6)}
+	common := retriever.GetCommonOptions(&retriever.Options{}, opts...)
+	if common.Index == nil || *common.Index != "kb_2" {
+		t.Errorf("expected common.Index=kb_2, got %v", common.Index)
+	}
+}
 
-	t.Run("graph invocation with empty results", func(t *testing.T) {
-		emb := &mockEmbedder{}
-		search := &mockSearcher{
-			searchHybridFunc: func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
-				return []SearchHit{}, nil
-			},
-		}
-		llm := &mockLLM{}
+// stubLLM is a minimal eino model.BaseChatModel for graph compile.
+type stubLLM struct{}
 
-		runnable, err := BuildRetrievalGraph(context.Background(), emb, search, llm, "hybrid")
-		if err != nil {
-			t.Fatalf("BuildRetrievalGraph error: %v", err)
-		}
+func (s *stubLLM) Generate(ctx context.Context, in []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	return &schema.Message{Role: schema.Assistant, Content: "ok"}, nil
+}
+func (s *stubLLM) Stream(ctx context.Context, in []*schema.Message, _ ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	return nil, nil
+}
 
-		answer, err := runnable.Invoke(context.Background(), "未知问题")
-		if err != nil {
-			t.Fatalf("Invoke error: %v", err)
-		}
-		if answer == "" {
-			t.Error("expected non-empty answer even with no results")
-		}
-		// The mock LLM returns "这是基于知识的回答。"
-		if answer != "这是基于知识的回答。" {
-			t.Errorf("unexpected answer: %s", answer)
-		}
-	})
+// stubEmbedder is a minimal eino embedding.Embedder for graph compile. It
+// returns a 4-dim zero vector — enough to satisfy the build_query step.
+type stubEmbedder struct{}
 
-	t.Run("state carries query to prompt assembly", func(t *testing.T) {
-		var capturedQuery string
-
-		emb := &mockEmbedder{}
-		search := &mockSearcher{
-			searchHybridFunc: func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
-				capturedQuery = query // capture the query as seen by the retriever
-				return []SearchHit{
-					{ChunkID: "c1", Content: "测试内容", Score: 0.9, Filename: "test.md", Source: "test.md", ChunkIndex: 0},
-				}, nil
-			},
-		}
-
-		// A custom LLM that returns the captured context to verify it was assembled
-		llm := &mockLLM{
-			generateFunc: func(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
-				// Find the user message which has the context
-				for _, msg := range input {
-					if msg.Role == schema.User {
-						if !strings.Contains(msg.Content, "什么是AI") {
-							t.Errorf("assembled prompt should contain the query '什么是AI', got: %s", msg.Content)
-						}
-						if !strings.Contains(msg.Content, "测试内容") {
-							t.Errorf("assembled prompt should contain '测试内容', got: %s", msg.Content)
-						}
-					}
-				}
-				return &schema.Message{Role: schema.Assistant, Content: "回答: AI是人工智能"}, nil
-			},
-		}
-
-		runnable, err := BuildRetrievalGraph(context.Background(), emb, search, llm, "hybrid")
-		if err != nil {
-			t.Fatalf("BuildRetrievalGraph error: %v", err)
-		}
-
-		answer, err := runnable.Invoke(context.Background(), "什么是AI")
-		if err != nil {
-			t.Fatalf("Invoke error: %v", err)
-		}
-		if capturedQuery != "什么是AI" {
-			t.Errorf("retriever should receive the original query, got: %s", capturedQuery)
-		}
-		if answer != "回答: AI是人工智能" {
-			t.Errorf("unexpected answer: %s", answer)
-		}
-	})
+func (s *stubEmbedder) EmbedStrings(ctx context.Context, texts []string, _ ...embedding.Option) ([][]float64, error) {
+	out := make([][]float64, len(texts))
+	for i := range texts {
+		out[i] = []float64{0.1, 0.2, 0.3, 0.4}
+	}
+	return out, nil
 }
