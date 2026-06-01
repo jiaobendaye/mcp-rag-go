@@ -34,3 +34,5 @@ data/logs/
 Reference/
 openspec/
 .env
+.playwright-mcp/
+test/e2e/run/

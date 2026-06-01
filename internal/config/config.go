@@ -13,7 +13,8 @@ import (
 // Config holds all application configuration.
 type Config struct {
 	// Server
-	HTTPPort int `yaml:"http_port"` // HTTP server port, default 8060
+	HTTPPort  int    `yaml:"http_port"`  // HTTP server port, default 8060
+	StaticDir string `yaml:"static_dir"` // static files directory, default "./static"
 
 	// Elasticsearch
 	ESUrl    string `yaml:"es_url"`    // ES connection URL
@@ -65,6 +66,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		HTTPPort:          8060,
+		StaticDir:         "./static",
 		ESUrl:             "http://localhost:9200",
 		ESIndex:           "kb_1",
 		KnowledgeBaseDBPath: "./data/knowledge_bases.sqlite3",

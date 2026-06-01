@@ -87,8 +87,8 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 	var body map[string]string
 	json.NewDecoder(w.Body).Decode(&body)
-	if body["status"] != "ok" {
-		t.Errorf("expected status=ok, got %s", body["status"])
+	if body["status"] != "healthy" {
+		t.Errorf("expected status=healthy, got %s", body["status"])
 	}
 }
 
@@ -171,4 +171,252 @@ func TestChatEndpoint(t *testing.T) {
 			t.Errorf("expected 400, got %d", w.Code)
 		}
 	})
+	t.Run("chat with extra fields", func(t *testing.T) {
+		body := `{"query":"test","collection":"default","kb_id":1,"limit":10,"user_id":1001,"agent_id":50}`
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/chat", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		var resp map[string]any
+		json.NewDecoder(w.Body).Decode(&resp)
+		if resp["collection"] == nil || resp["collection"] == "" {
+			t.Error("expected collection in response")
+		}
+	})
+}
+
+func TestConfigGetFlatFormat(t *testing.T) {
+	r := setupTestServer()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/config", nil)
+	r.ServeHTTP(w, req)
+
+	// When no configManager, config routes are not registered
+	if w.Code == 404 {
+		return
+	}
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	// Should have flat fields at top level
+	if _, ok := resp["http_port"]; !ok {
+		t.Error("expected http_port at top level")
+	}
+
+	// Should have provider_configs
+	if pc, ok := resp["provider_configs"]; !ok || pc == nil {
+		t.Error("expected provider_configs")
+	}
+
+	// Should have host/port aliases
+	if host := resp["host"]; host != "0.0.0.0" {
+		t.Errorf("expected host=0.0.0.0, got %v", host)
+	}
+}
+
+func TestSPARedirects(t *testing.T) {
+	r := setupTestServer()
+
+	tests := []struct {
+		path     string
+		expected int
+		location string
+	}{
+		{"/", 302, "/app"},
+		{"/doc", 302, "/docs"},
+		{"/documents-page", 302, "/app/documents"},
+		{"/config-page", 302, "/app/config"},
+	}
+
+	for _, tc := range tests {
+		t.Run("redirect"+tc.path, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", tc.path, nil)
+			r.ServeHTTP(w, req)
+			if w.Code != tc.expected {
+				t.Errorf("expected %d, got %d", tc.expected, w.Code)
+			}
+			if loc := w.Header().Get("Location"); loc != tc.location {
+				t.Errorf("expected Location=%s, got %s", tc.location, loc)
+			}
+		})
+	}
+}
+
+func TestDocsAndOpenAPI(t *testing.T) {
+	r := setupTestServer()
+
+	t.Run("docs returns html", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/docs", nil)
+		r.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Errorf("expected 200, got %d", w.Code)
+		}
+		ct := w.Header().Get("Content-Type")
+		if !strings.Contains(ct, "text/html") {
+			t.Errorf("expected text/html, got %s", ct)
+		}
+	})
+
+	t.Run("openapi.json is valid", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/openapi.json", nil)
+		r.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Errorf("expected 200, got %d", w.Code)
+		}
+		var spec map[string]any
+		if err := json.NewDecoder(w.Body).Decode(&spec); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if spec["openapi"] == nil {
+			t.Error("expected openapi version")
+		}
+		if _, ok := spec["paths"]; !ok {
+			t.Error("expected paths in openapi spec")
+		}
+	})
+}
+
+func TestProviderModels(t *testing.T) {
+	r := setupTestServer()
+
+	t.Run("models endpoint", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/providers/openai/models", nil)
+		r.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp map[string]any
+		json.NewDecoder(w.Body).Decode(&resp)
+		if resp["provider"] != "openai" {
+			t.Errorf("expected provider=openai, got %v", resp["provider"])
+		}
+		models, ok := resp["models"].([]interface{})
+		if !ok {
+			t.Fatal("expected models array")
+		}
+		if len(models) == 0 {
+			t.Error("expected at least one model")
+		}
+	})
+
+	t.Run("models with family filter", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", "/providers/openai/models?family=embedding", nil)
+		r.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("expected 200, got %d", w.Code)
+		}
+
+		var resp map[string]any
+		json.NewDecoder(w.Body).Decode(&resp)
+		if resp["family"] != "embedding" {
+			t.Errorf("expected family=embedding, got %v", resp["family"])
+		}
+	})
+}
+
+func TestSearchResponseEnrichment(t *testing.T) {
+	r := setupTestServer()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/search?query=test&limit=2", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	results, ok := resp["results"].([]interface{})
+	if !ok || len(results) == 0 {
+		t.Fatal("expected non-empty results")
+	}
+
+	first := results[0].(map[string]any)
+
+	if _, ok := first["vector_score"]; !ok {
+		t.Error("expected vector_score in search result")
+	}
+	if _, ok := first["retrieval_method"]; !ok {
+		t.Error("expected retrieval_method in search result")
+	}
+	if _, ok := first["metadata"]; !ok {
+		t.Error("expected metadata in search result")
+	}
+}
+
+func TestHealthFormatCompatibility(t *testing.T) {
+	r := setupTestServer()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/health", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	requiredFields := []string{"healthy", "ready", "bootstrapped", "runtime", "config_revision", "reasons"}
+	for _, f := range requiredFields {
+		if _, ok := resp[f]; !ok {
+			t.Errorf("expected %s field in health response", f)
+		}
+	}
+
+	if rt, ok := resp["runtime"].(map[string]any); ok {
+		runtimeKeys := []string{"embedding_model", "llm_model", "vector_store", "knowledge_base"}
+		for _, rk := range runtimeKeys {
+			if _, ok := rt[rk]; !ok {
+				t.Errorf("expected runtime.%s in health response", rk)
+			}
+		}
+	}
+}
+
+func TestReadyFormatCompatibility(t *testing.T) {
+	r := setupTestServer()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/ready", nil)
+	r.ServeHTTP(w, req)
+
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	requiredFields := []string{"bootstrapped", "ready", "runtime", "config_revision"}
+	for _, f := range requiredFields {
+		if _, ok := resp[f]; !ok {
+			t.Errorf("expected %s field in ready response", f)
+		}
+	}
+}
+
+func TestStaticRouteExists(t *testing.T) {
+	r := setupTestServer()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/static/nonexistent.js", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Errorf("expected 404 for missing static file, got %d", w.Code)
+	}
 }

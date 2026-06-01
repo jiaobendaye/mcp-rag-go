@@ -11,7 +11,15 @@ import (
 
 // ChatRequest contains the input for a chat request.
 type ChatRequest struct {
-	Query string `json:"query"`
+	Query      string  `json:"query"`
+	Collection string  `json:"collection,omitempty"`
+	KBID       *int64  `json:"kb_id,omitempty"`
+	KBIDs      []int64 `json:"kb_ids,omitempty"`
+	Limit      int     `json:"limit,omitempty"`
+	UserID     *int64  `json:"user_id,omitempty"`
+	AgentID    *int64  `json:"agent_id,omitempty"`
+	Scope      string  `json:"scope,omitempty"`
+	APIKey     string  `json:"api_key,omitempty"`
 }
 
 // ChatResponse contains the result of a chat request (compatible with Python MCP-RAG format).
@@ -72,9 +80,14 @@ func (c *ChatService) chatViaGraph(ctx context.Context, req *ChatRequest) (*Chat
 		return nil, fmt.Errorf("graph invoke: %w", err)
 	}
 
+	collection := req.Collection
+	if collection == "" {
+		collection = "kb_1"
+	}
+
 	return &ChatResponse{
 		Query:      req.Query,
-		Collection: "kb_1",
+		Collection: collection,
 		Response:   answer,
 		Sources:    nil,
 	}, nil
@@ -88,14 +101,24 @@ func (c *ChatService) chatViaRaw(ctx context.Context, req *ChatRequest) (*ChatRe
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
 
-	hits, err := c.searcher.SearchHybrid(ctx, req.Query, toFloat32(vecs[0]), 5, 0.7)
+	topK := 5
+	if req.Limit > 0 {
+		topK = req.Limit
+	}
+
+	hits, err := c.searcher.SearchHybrid(ctx, req.Query, toFloat32(vecs[0]), topK, 0.7)
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}
 
+	collection := req.Collection
+	if collection == "" {
+		collection = "kb_1"
+	}
+
 	if len(hits) == 0 {
 		return &ChatResponse{
-			Query: req.Query, Collection: "kb_1",
+			Query: req.Query, Collection: collection,
 			Response: fmt.Sprintf("未找到与 \"%s\" 相关的信息。", req.Query),
 			Sources:  []SearchHit{},
 		}, nil
@@ -109,11 +132,11 @@ func (c *ChatService) chatViaRaw(ctx context.Context, req *ChatRequest) (*ChatRe
 	})
 	if err != nil {
 		answer := formatFallbackResponse(hits, err)
-		return &ChatResponse{Query: req.Query, Collection: "kb_1", Response: answer, Sources: hits}, nil
+		return &ChatResponse{Query: req.Query, Collection: collection, Response: answer, Sources: hits}, nil
 	}
 
 	return &ChatResponse{
-		Query: req.Query, Collection: "kb_1",
+		Query: req.Query, Collection: collection,
 		Response: msg.Content,
 		Sources:  hits,
 	}, nil

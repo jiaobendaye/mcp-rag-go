@@ -31,13 +31,16 @@ type Chunk struct {
 
 // SearchHit represents a search result from ES.
 type SearchHit struct {
-	ChunkID    string  `json:"chunk_id"`
-	DocumentID string  `json:"document_id"`
-	Score      float64 `json:"score"`
-	Source     string  `json:"source"`
-	Filename   string  `json:"filename"`
-	Content    string  `json:"content"`
-	ChunkIndex int     `json:"chunk_index"`
+	ChunkID         string  `json:"chunk_id"`
+	DocumentID      string  `json:"document_id"`
+	Score           float64 `json:"score"`
+	VectorScore     float64 `json:"vector_score,omitempty"`
+	KeywordScore    float64 `json:"keyword_score,omitempty"`
+	RetrievalMethod string  `json:"retrieval_method,omitempty"`
+	Source          string  `json:"source"`
+	Filename        string  `json:"filename"`
+	Content         string  `json:"content"`
+	ChunkIndex      int     `json:"chunk_index"`
 }
 
 // GenerateChunkID creates a deterministic chunk ID from document ID and index.

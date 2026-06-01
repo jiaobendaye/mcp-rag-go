@@ -75,19 +75,33 @@ func (s *Server) Setup() *gin.Engine {
 	// Security middleware (auth + rate-limit, no-op when disabled)
 	r.Use(SecurityMiddleware(s.cfg))
 
+	// Root and legacy redirects
+	r.GET("/", func(c *gin.Context) { c.Redirect(http.StatusFound, "/app") })
+	r.GET("/doc", func(c *gin.Context) { c.Redirect(http.StatusFound, "/docs") })
+	r.GET("/documents-page", func(c *gin.Context) { c.Redirect(http.StatusFound, "/app/documents") })
+	r.GET("/config-page", func(c *gin.Context) { c.Redirect(http.StatusFound, "/app/config") })
+
+	// API docs
+	r.GET("/docs", s.serveDocs)
+	r.GET("/openapi.json", s.serveOpenAPI)
+
+	// SPA static file serving (after /docs so /docs is not captured by SPA)
+	s.initSPA(r)
+
 	// System
 	r.GET("/health", s.health)
 	r.GET("/metrics", s.metrics)
 	r.GET("/ready", s.ready)
 
-	// Config management
-	if s.configManager != nil {
-		r.GET("/config", s.configGet)
-		r.POST("/config", s.configSet)
-		r.POST("/config/bulk", s.configSetBulk)
-		r.POST("/config/reset", s.configReset)
-		r.POST("/config/reload", s.configReload)
-	}
+	// Config management (always registered for SPA compatibility)
+	r.GET("/config", s.configGet)
+	r.POST("/config", s.configSet)
+	r.POST("/config/bulk", s.configSetBulk)
+	r.POST("/config/reset", s.configReset)
+	r.POST("/config/reload", s.configReload)
+
+	// Model discovery
+	r.GET("/providers/:provider/models", s.providerModels)
 
 	// Document
 	r.POST("/add-document", s.addDocument)
@@ -129,6 +143,11 @@ func (s *Server) resolveKB(c *gin.Context) (*knowledgebase.Resolution, string, e
 	userID := parseIntPtr(c.Query("user_id"))
 	agentID := parseIntPtr(c.Query("agent_id"))
 
+	// Fallback to legacy ES index when KB service is not available
+	if s.kbs == nil {
+		return nil, s.cfg.ESIndex, nil
+	}
+
 	legacyKey := ""
 	if kbID == nil && scope == nil {
 		legacyKey = "legacy:public:" + collection
@@ -164,18 +183,66 @@ func strPtr(s string) *string {
 
 // health responds with structured service status (compatible with Python format).
 func (s *Server) health(c *gin.Context) {
-	if s.metricsCollector == nil {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-		return
+	// Build runtime info (mirrors Python format)
+	runtime := gin.H{
+		"embedding_model": gin.H{
+			"provider": s.cfg.EmbeddingProvider,
+			"model":    s.cfg.EmbeddingModel,
+		},
+		"llm_model": gin.H{
+			"provider": s.cfg.LLMProvider,
+			"model":    s.cfg.LLMModel,
+		},
+		"vector_store": gin.H{
+			"type": "elasticsearch",
+		},
+		"knowledge_base": gin.H{
+			"type": "sqlite",
+		},
 	}
-	hd := s.metricsCollector.HealthDetail()
-	c.JSON(http.StatusOK, gin.H{
-		"status":         string(hd.Status),
-		"uptime_seconds": hd.UptimeSeconds,
-		"total_requests": hd.TotalRequests,
-		"error_count":    hd.ErrorCount,
-		"operations":     hd.Operations,
-	})
+
+	revision := int64(0)
+	if s.configManager != nil {
+		revision = s.configManager.Revision()
+	}
+
+	// Determine readiness
+	bootstrapped := s.embedder != nil && s.esIndexer != nil && s.kbs != nil
+	ready := bootstrapped
+	if ready && s.esIndexer != nil {
+		if err := s.esIndexer.HealthCheck(context.Background()); err != nil {
+			ready = false
+		}
+	}
+	healthy := ready
+
+	reasons := []string{}
+	if !bootstrapped {
+		reasons = append(reasons, "service not fully bootstrapped")
+	}
+	if bootstrapped && !ready {
+		reasons = append(reasons, "elasticsearch not reachable")
+	}
+
+	resp := gin.H{
+		"status":          "healthy",
+		"healthy":         healthy,
+		"ready":           ready,
+		"bootstrapped":    bootstrapped,
+		"runtime":         runtime,
+		"config_revision": revision,
+		"reasons":         reasons,
+	}
+
+	if s.metricsCollector != nil {
+		hd := s.metricsCollector.HealthDetail()
+		resp["uptime_seconds"] = hd.UptimeSeconds
+		resp["total_requests"] = hd.TotalRequests
+		resp["error_count"] = hd.ErrorCount
+		resp["operations"] = hd.Operations
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 // metrics returns the full metrics snapshot.
@@ -188,75 +255,237 @@ func (s *Server) metrics(c *gin.Context) {
 	c.JSON(http.StatusOK, snap)
 }
 
-// ready checks component-level readiness.
+// ready checks component-level readiness (compatible with Python format).
 func (s *Server) ready(c *gin.Context) {
-	components := make(map[string]gin.H)
-
-	// Embedding model
-	if s.embedder != nil {
-		components["embedding_model"] = gin.H{
-			"status": "ready",
-			"detail": s.cfg.EmbeddingProvider + "/" + s.cfg.EmbeddingModel,
-		}
-	} else {
-		components["embedding_model"] = gin.H{"status": "not_configured", "detail": ""}
+	// Build runtime info
+	runtime := gin.H{
+		"embedding_model": gin.H{
+			"provider": s.cfg.EmbeddingProvider,
+			"model":    s.cfg.EmbeddingModel,
+		},
+		"llm_model": gin.H{
+			"provider": s.cfg.LLMProvider,
+			"model":    s.cfg.LLMModel,
+		},
+		"vector_store": gin.H{
+			"type": "elasticsearch",
+		},
+		"knowledge_base": gin.H{
+			"type": "sqlite",
+		},
 	}
 
-	// LLM model
-	if s.cfg.LLMModel != "" {
-		components["llm_model"] = gin.H{
-			"status": "ready",
-			"detail": s.cfg.LLMProvider + "/" + s.cfg.LLMModel,
-		}
-	} else {
-		components["llm_model"] = gin.H{"status": "not_configured", "detail": ""}
+	revision := int64(0)
+	if s.configManager != nil {
+		revision = s.configManager.Revision()
 	}
 
-	// Vector store (ES)
-	if s.esIndexer != nil {
-		if err := s.esIndexer.HealthCheck(context.Background()); err == nil {
-			components["vector_store"] = gin.H{"status": "ready", "detail": "elasticsearch"}
-		} else {
-			components["vector_store"] = gin.H{"status": "error", "detail": err.Error()}
-		}
-	} else {
-		components["vector_store"] = gin.H{"status": "not_configured", "detail": ""}
-	}
-
-	// Knowledge base
-	if s.kbs != nil {
-		components["knowledge_base"] = gin.H{"status": "ready", "detail": "sqlite"}
-	} else {
-		components["knowledge_base"] = gin.H{"status": "not_configured", "detail": ""}
-	}
-
-	// Determine overall status
-	overallStatus := "ready"
-	for _, comp := range components {
-		s, _ := comp["status"].(string)
-		if s == "error" || s == "not_configured" {
-			overallStatus = "not_ready"
-			break
+	bootstrapped := s.embedder != nil && s.esIndexer != nil && s.kbs != nil
+	ready := bootstrapped
+	if ready && s.esIndexer != nil {
+		if err := s.esIndexer.HealthCheck(context.Background()); err != nil {
+			ready = false
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"status":     overallStatus,
-		"components": components,
-	})
+	resp := gin.H{
+		"bootstrapped":    bootstrapped,
+		"ready":           ready,
+		"runtime":         runtime,
+		"config_revision": revision,
+	}
+
+	status := http.StatusOK
+	if !ready {
+		status = http.StatusServiceUnavailable
+	}
+	c.JSON(status, resp)
 }
 
-// configGet returns all configuration values with revision and path.
+// configGet returns all configuration values in flat format (Python-compatible).
 func (s *Server) configGet(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"config":      s.configManager.GetAll(),
-		"revision":    s.configManager.Revision(),
-		"config_path": s.configManager.ConfigPath(),
-	})
+	result := s.buildConfigGetResponse()
+	c.JSON(http.StatusOK, result)
+}
+
+// buildConfigGetResponse builds the full config response, working with or without configManager.
+func (s *Server) buildConfigGetResponse() gin.H {
+	revision := int64(0)
+	configPath := ""
+
+	if s.configManager != nil {
+		cfg := s.configManager.GetAll()
+		rawCfg := s.configManager.Get()
+		revision = s.configManager.Revision()
+		configPath = s.configManager.ConfigPath()
+
+		result := make(gin.H, len(cfg)+20)
+		result["config_revision"] = revision
+		result["config_path"] = configPath
+
+		for k, v := range cfg {
+			result[k] = v
+		}
+
+		result["provider_configs"] = s.buildProviderConfigs()
+
+		result["cache"] = gin.H{
+			"enabled":     false,
+			"max_entries": 256,
+			"ttl_seconds": 300,
+		}
+
+		result["security"] = gin.H{
+			"enabled":          rawCfg.SecurityEnabled,
+			"allow_anonymous":  rawCfg.SecurityAllowAnonymous,
+			"api_keys":         rawCfg.SecurityAPIKeys,
+			"tenant_api_keys":  rawCfg.SecurityTenantAPIKeys,
+		}
+
+		result["rate_limit"] = gin.H{
+			"requests_per_window": rawCfg.RateLimitRequestsPerWindow,
+			"window_seconds":      rawCfg.RateLimitWindowSeconds,
+			"burst":               rawCfg.RateLimitBurst,
+		}
+
+		result["quotas"] = gin.H{
+			"max_upload_files":      rawCfg.QuotaMaxUploadFiles,
+			"max_upload_bytes":      rawCfg.QuotaMaxUploadBytes,
+			"max_upload_file_bytes": rawCfg.QuotaMaxUploadFileBytes,
+			"max_index_documents":   rawCfg.QuotaMaxIndexDocuments,
+			"max_index_chunks":      rawCfg.QuotaMaxIndexChunks,
+			"max_index_chars":       rawCfg.QuotaMaxIndexChars,
+		}
+
+		result["host"] = "0.0.0.0"
+		result["port"] = result["http_port"]
+		result["debug"] = false
+		result["vector_db_type"] = "elasticsearch"
+		result["max_retrieval_results"] = result["top_k"]
+		result["similarity_threshold"] = result["min_score"]
+
+		return result
+	}
+
+	// Fallback: use startup config directly
+	result := gin.H{
+		"http_port":             s.cfg.HTTPPort,
+		"host":                  "0.0.0.0",
+		"port":                  s.cfg.HTTPPort,
+		"debug":                 false,
+		"vector_db_type":        "elasticsearch",
+		"es_url":                s.cfg.ESUrl,
+		"es_index":              s.cfg.ESIndex,
+		"knowledge_base_db_path": s.cfg.KnowledgeBaseDBPath,
+		"embedding_provider":     s.cfg.EmbeddingProvider,
+		"embedding_model":        s.cfg.EmbeddingModel,
+		"embedding_base_url":     s.cfg.EmbeddingBaseURL,
+		"llm_provider":           s.cfg.LLMProvider,
+		"llm_model":              s.cfg.LLMModel,
+		"llm_base_url":           s.cfg.LLMBaseURL,
+		"chunk_size":             s.cfg.ChunkSize,
+		"chunk_overlap":          s.cfg.ChunkOverlap,
+		"top_k":                  s.cfg.TopK,
+		"min_score":              s.cfg.MinScore,
+		"search_mode":            s.cfg.SearchMode,
+		"max_retrieval_results":  s.cfg.TopK,
+		"similarity_threshold":   s.cfg.MinScore,
+		"config_revision":        revision,
+		"config_path":            configPath,
+		"cache": gin.H{
+			"enabled": false, "max_entries": 256, "ttl_seconds": 300,
+		},
+		"security": gin.H{
+			"enabled": s.cfg.SecurityEnabled, "allow_anonymous": s.cfg.SecurityAllowAnonymous,
+			"api_keys": s.cfg.SecurityAPIKeys, "tenant_api_keys": s.cfg.SecurityTenantAPIKeys,
+		},
+		"rate_limit": gin.H{
+			"requests_per_window": s.cfg.RateLimitRequestsPerWindow,
+			"window_seconds":      s.cfg.RateLimitWindowSeconds,
+			"burst":               s.cfg.RateLimitBurst,
+		},
+		"quotas": gin.H{
+			"max_upload_files": s.cfg.QuotaMaxUploadFiles, "max_upload_bytes": s.cfg.QuotaMaxUploadBytes,
+			"max_upload_file_bytes": s.cfg.QuotaMaxUploadFileBytes,
+			"max_index_documents":   s.cfg.QuotaMaxIndexDocuments,
+			"max_index_chunks":      s.cfg.QuotaMaxIndexChunks,
+			"max_index_chars":       s.cfg.QuotaMaxIndexChars,
+		},
+	}
+
+	// provider_configs from startup config
+	result["provider_configs"] = s.buildProviderConfigsFromStartup()
+
+	return result
+}
+
+// buildProviderConfigs constructs the provider_configs object from configManager.
+func (s *Server) buildProviderConfigs() gin.H {
+	cfg := s.configManager.Get()
+	return s.buildProviderConfigsFromCfg(cfg)
+}
+
+// buildProviderConfigsFromStartup constructs provider_configs from startup config (fallback).
+func (s *Server) buildProviderConfigsFromStartup() gin.H {
+	return s.buildProviderConfigsFromCfg(s.cfg)
+}
+
+// buildProviderConfigsFromCfg builds provider_configs from a *Config value.
+func (s *Server) buildProviderConfigsFromCfg(cfg *config.Config) gin.H {
+
+	providerConfigs := gin.H{}
+
+	// Main embedding provider
+	embeddingCfg := gin.H{
+		"base_url":          cfg.EmbeddingBaseURL,
+		"api_key":           maskAPIKey(cfg.EmbeddingAPIKey),
+		"model":             cfg.EmbeddingModel,
+		"llm_model":         nil,
+		"embedding_model":   cfg.EmbeddingModel,
+		"chat_models":       []string{},
+		"embedding_models":  []string{cfg.EmbeddingModel},
+	}
+	providerConfigs[cfg.EmbeddingProvider] = embeddingCfg
+
+	// Main LLM provider (may be same as embedding provider)
+	if cfg.LLMProvider != cfg.EmbeddingProvider {
+		providerConfigs[cfg.LLMProvider] = gin.H{
+			"base_url":         cfg.LLMBaseURL,
+			"api_key":          maskAPIKey(cfg.LLMAPIKey),
+			"model":            cfg.LLMModel,
+			"llm_model":        cfg.LLMModel,
+			"embedding_model":  nil,
+			"chat_models":      []string{cfg.LLMModel},
+			"embedding_models": []string{},
+		}
+	} else {
+		// Merge LLM model into existing provider
+		embeddingCfg["llm_model"] = cfg.LLMModel
+		embeddingCfg["model"] = cfg.LLMModel
+		embeddingCfg["chat_models"] = []string{cfg.LLMModel}
+		providerConfigs[cfg.EmbeddingProvider] = embeddingCfg
+	}
+
+	return providerConfigs
+}
+
+// maskAPIKey masks an API key for display: show first 4 and last 4 chars.
+func maskAPIKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	if len(key) <= 8 {
+		return "****"
+	}
+	return key[:4] + "****" + key[len(key)-4:]
 }
 
 // configSet updates a single configuration value.
 func (s *Server) configSet(c *gin.Context) {
+	if s.configManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "config manager not available"})
+		return
+	}
 	var req struct {
 		Key   string      `json:"key"`
 		Value interface{} `json:"value"`
@@ -279,11 +508,21 @@ func (s *Server) configSet(c *gin.Context) {
 }
 
 // configSetBulk updates multiple configuration values at once.
+// Supports both flat {key: value} and SPA's {"updates": {key: value}} format.
 func (s *Server) configSetBulk(c *gin.Context) {
+	if s.configManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "config manager not available"})
+		return
+	}
 	var bulk map[string]interface{}
 	if err := c.ShouldBindJSON(&bulk); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
 		return
+	}
+
+	// Unwrap SPA format: {"updates": {...}}
+	if updates, ok := bulk["updates"].(map[string]interface{}); ok {
+		bulk = updates
 	}
 
 	for key, value := range bulk {
@@ -298,12 +537,20 @@ func (s *Server) configSetBulk(c *gin.Context) {
 
 // configReset resets configuration to defaults.
 func (s *Server) configReset(c *gin.Context) {
+	if s.configManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "config manager not available"})
+		return
+	}
 	s.configManager.Reset()
 	c.JSON(http.StatusOK, gin.H{"status": "reset"})
 }
 
 // configReload reloads configuration from disk.
 func (s *Server) configReload(c *gin.Context) {
+	if s.configManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "config manager not available"})
+		return
+	}
 	if err := s.configManager.Reload(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -398,6 +645,10 @@ func (s *Server) deleteFile(c *gin.Context) {
 
 // listKnowledgeBases returns accessible knowledge bases.
 func (s *Server) listKnowledgeBases(c *gin.Context) {
+	if s.kbs == nil {
+		c.JSON(http.StatusOK, gin.H{"knowledge_bases": []gin.H{}})
+		return
+	}
 	userID := parseIntPtr(c.Query("user_id"))
 	kbs, err := s.kbs.ListAccessible(userID)
 	if err != nil {
@@ -409,6 +660,10 @@ func (s *Server) listKnowledgeBases(c *gin.Context) {
 
 // createKnowledgeBase creates a new knowledge base.
 func (s *Server) createKnowledgeBase(c *gin.Context) {
+	if s.kbs == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "knowledge base service not available"})
+		return
+	}
 	var req struct {
 		Name         string `json:"name"`
 		Scope        string `json:"scope"`
@@ -604,10 +859,17 @@ func (s *Server) search(c *gin.Context) {
 		}
 	}
 
+	// Resolve KB
+	resolution, indexName, err := s.resolveKB(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+
 	// Check cache first
 	if s.retrievalCache != nil {
 		cacheKey := rag.RetrievalCacheKey{
-			Collection: s.cfg.ESIndex,
+			Collection: indexName,
 			Query:      query,
 			Mode:       s.cfg.SearchMode,
 			Limit:      limit,
@@ -617,10 +879,6 @@ func (s *Server) search(c *gin.Context) {
 			c.JSON(http.StatusOK, cached)
 			return
 		}
-		defer func() {
-			// We need to set the cache after building the response
-			// This is handled below after response is constructed
-		}()
 	}
 
 	// Embed the query
@@ -640,25 +898,50 @@ func (s *Server) search(c *gin.Context) {
 	// Format response compatible with Python MCP-RAG
 	results := make([]gin.H, 0, len(hits))
 	for _, h := range hits {
-		results = append(results, gin.H{
+		result := gin.H{
 			"content":  h.Content,
 			"score":    h.Score,
-			"metadata": gin.H{},
 			"source":   h.Source,
 			"filename": h.Filename,
-		})
+		}
+
+		// Enriched metadata with KB info
+		metadata := gin.H{}
+		if resolution != nil {
+			metadata["knowledge_base_id"] = resolution.KnowledgeBase.ID
+			metadata["knowledge_base_name"] = resolution.KnowledgeBase.Name
+			metadata["knowledge_base_scope"] = resolution.KnowledgeBase.Scope
+		}
+		result["metadata"] = metadata
+
+		// Vector/keyword score and retrieval method
+		switch s.cfg.SearchMode {
+		case "hybrid", "rrf":
+			result["vector_score"] = h.Score
+			result["keyword_score"] = h.Score
+			result["retrieval_method"] = "hybrid"
+		case "knn":
+			result["vector_score"] = h.Score
+			result["keyword_score"] = 0.0
+			result["retrieval_method"] = "vector"
+		default:
+			result["vector_score"] = h.Score
+			result["retrieval_method"] = s.cfg.SearchMode
+		}
+
+		results = append(results, result)
 	}
 
 	searchResp := gin.H{
 		"query":      query,
-		"collection": s.cfg.ESIndex,
+		"collection": indexName,
 		"results":    results,
 	}
 
 	// Store in cache
 	if s.retrievalCache != nil {
 		cacheKey := rag.RetrievalCacheKey{
-			Collection: s.cfg.ESIndex,
+			Collection: indexName,
 			Query:      query,
 			Mode:       s.cfg.SearchMode,
 			Limit:      limit,
@@ -668,7 +951,7 @@ func (s *Server) search(c *gin.Context) {
 		copy(searchHits, hits)
 		s.retrievalCache.Set(cacheKey, &rag.SearchResponse{
 			Query:      query,
-			Collection: s.cfg.ESIndex,
+			Collection: indexName,
 			Results:    searchHits,
 		})
 	}
@@ -688,6 +971,15 @@ func (s *Server) chat(c *gin.Context) {
 		return
 	}
 
+	// Resolve KB from request fields
+	if req.KBID != nil || req.Scope != "" || req.Collection != "" {
+		resolution, indexName, err := s.resolveKBFromChat(&req)
+		if err == nil {
+			req.Collection = indexName
+			_ = resolution
+		}
+	}
+
 	resp, err := s.chatSvc.Chat(c.Request.Context(), &req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
@@ -695,6 +987,42 @@ func (s *Server) chat(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// resolveKBFromChat resolves KB from ChatRequest fields.
+func (s *Server) resolveKBFromChat(req *rag.ChatRequest) (*knowledgebase.Resolution, string, error) {
+	if s.kbs == nil {
+		return nil, s.cfg.ESIndex, nil
+	}
+
+	scope := req.Scope
+	var scopePtr *string
+	if scope != "" {
+		scopePtr = &scope
+	}
+
+	collection := req.Collection
+	if collection == "" {
+		collection = "default"
+	}
+
+	legacyKey := ""
+	if req.KBID == nil && scopePtr == nil {
+		legacyKey = "legacy:public:" + collection
+	}
+
+	resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{
+		KBID:               req.KBID,
+		Scope:              scopePtr,
+		UserID:             req.UserID,
+		AgentID:            req.AgentID,
+		LegacyCollection:   &collection,
+		LegacyCollectionKey: &legacyKey,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return resolution, resolution.KnowledgeBase.IndexName(), nil
 }
 
 // saveTemp saves an uploaded file to a temporary location.
