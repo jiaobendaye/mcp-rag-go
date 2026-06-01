@@ -11,15 +11,16 @@ import (
 
 // ChatRequest contains the input for a chat request.
 type ChatRequest struct {
-	Query      string  `json:"query"`
-	Collection string  `json:"collection,omitempty"`
-	KBID       *int64  `json:"kb_id,omitempty"`
-	KBIDs      []int64 `json:"kb_ids,omitempty"`
-	Limit      int     `json:"limit,omitempty"`
-	UserID     *int64  `json:"user_id,omitempty"`
-	AgentID    *int64  `json:"agent_id,omitempty"`
-	Scope      string  `json:"scope,omitempty"`
-	APIKey     string  `json:"api_key,omitempty"`
+	Query               string  `json:"query"`
+	Collection          string  `json:"collection,omitempty"`
+	KBID                *int64  `json:"kb_id,omitempty"`
+	KBIDs               []int64 `json:"kb_ids,omitempty"`
+	Limit               int     `json:"limit,omitempty"`
+	UserID              *int64  `json:"user_id,omitempty"`
+	AgentID             *int64  `json:"agent_id,omitempty"`
+	Scope               string  `json:"scope,omitempty"`
+	APIKey              string  `json:"api_key,omitempty"`
+	PreRetrievedContext string  `json:"-"` // pre-built context for multi-KB mode
 }
 
 // ChatResponse contains the result of a chat request (compatible with Python MCP-RAG format).
@@ -62,6 +63,11 @@ func NewChatService(searcher Searcher, embedder Embedder, llm LLMGenerator, grap
 func (c *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	if strings.TrimSpace(req.Query) == "" {
 		return nil, fmt.Errorf("query is required")
+	}
+
+	// If context is pre-populated (multi-KB mode), skip retrieval
+	if req.PreRetrievedContext != "" {
+		return c.generateFromContext(ctx, req)
 	}
 
 	// Use graph mode if available
@@ -142,6 +148,32 @@ func (c *ChatService) chatViaRaw(ctx context.Context, req *ChatRequest) (*ChatRe
 	}, nil
 }
 
+// generateFromContext skips retrieval and uses the pre-built context from ChatRequest.
+func (c *ChatService) generateFromContext(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
+	collection := req.Collection
+	if collection == "" {
+		collection = "multi_kb"
+	}
+
+	prompt := buildChatPromptFromContext(req.Query, req.PreRetrievedContext)
+
+	msg, err := c.llm.Generate(ctx, []*schema.Message{
+		{Role: schema.User, Content: prompt},
+	})
+	if err != nil {
+		return &ChatResponse{
+			Query: req.Query, Collection: collection,
+			Response: fmt.Sprintf("### Retrieved Context\n\n%s\n\n### Note\nLLM is not available. The above context was retrieved for your query.\n\nLLM error: %s",
+				req.PreRetrievedContext, err.Error()),
+		}, nil
+	}
+
+	return &ChatResponse{
+		Query: req.Query, Collection: collection,
+		Response: msg.Content,
+	}, nil
+}
+
 func buildChatPrompt(query string, hits []SearchHit) string {
 	var sb strings.Builder
 	sb.WriteString("基于以下知识库内容回答用户的问题。如果知识库内容不足以回答问题，请说明无法找到相关信息。\n\n")
@@ -152,6 +184,16 @@ func buildChatPrompt(query string, hits []SearchHit) string {
 	sb.WriteString(fmt.Sprintf("用户问题: %s\n\n", query))
 	sb.WriteString("请提供准确、简洁的回答:")
 	return sb.String()
+}
+
+func buildChatPromptFromContext(query, context string) string {
+	return fmt.Sprintf(
+		"基于以下知识库内容回答用户的问题。如果知识库内容不足以回答问题，请说明无法找到相关信息。\n\n"+
+			"知识库内容:\n%s\n\n"+
+			"用户问题: %s\n\n"+
+			"请提供准确、简洁的回答:",
+		context, query,
+	)
 }
 
 func formatFallbackResponse(hits []SearchHit, err error) string {

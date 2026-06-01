@@ -139,7 +139,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Setup HTTP
 	gin.SetMode(gin.ReleaseMode)
-	srv := server.New(cfg, configManager, metricsCollector, retrievalCache, chain, chatSvc, esIndexer, embedder, kbService, esIndexer)
+	srv := server.New(cfg, configManager, metricsCollector, retrievalCache, chain, chatSvc, esIndexer, embedder, kbService, esIndexer, dims)
 	router := srv.Setup()
 
 	httpServer := &http.Server{Addr: fmt.Sprintf(":%d", cfg.HTTPPort), Handler: router}

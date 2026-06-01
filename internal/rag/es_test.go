@@ -68,6 +68,10 @@ func (m *mockSearcher) SearchWithMode(ctx context.Context, query string, queryVe
 	return m.SearchHybrid(ctx, query, queryVector, topK, minScore) // Default to hybrid
 }
 
+func (m *mockSearcher) SearchWithWeights(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string, weights SearchWeights) ([]SearchHit, error) {
+	return m.SearchWithMode(ctx, query, queryVector, topK, minScore, mode)
+}
+
 func TestGenerateChunkID(t *testing.T) {
 	tests := []struct {
 		name     string

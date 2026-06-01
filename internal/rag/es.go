@@ -45,20 +45,29 @@ func (e *ES8Indexer) HealthCheck(ctx context.Context) error {
 
 // EnsureIndex creates the ES index with proper mapping if it doesn't exist.
 func (e *ES8Indexer) EnsureIndex(ctx context.Context, dims int) error {
+	return e.ensureIndex(ctx, e.indexName, dims)
+}
+
+// EnsureIndexForKB creates an ES index with the given name if it doesn't exist.
+func (e *ES8Indexer) EnsureIndexForKB(ctx context.Context, indexName string, dims int) error {
+	return e.ensureIndex(ctx, indexName, dims)
+}
+
+func (e *ES8Indexer) ensureIndex(ctx context.Context, indexName string, dims int) error {
 	// Check if index exists
-	res, err := e.client.Indices.Exists([]string{e.indexName})
+	res, err := e.client.Indices.Exists([]string{indexName})
 	if err != nil {
 		return fmt.Errorf("check index exists: %w", err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode == 200 {
-		log.Printf("Index %s already exists", e.indexName)
+		log.Printf("Index %s already exists", indexName)
 		return nil
 	}
 
 	// Create index with mapping
-	log.Printf("Creating index %s with dims=%d", e.indexName, dims)
+	log.Printf("Creating index %s with dims=%d", indexName, dims)
 
 	mapping := map[string]any{
 		"mappings": map[string]any{
@@ -82,7 +91,7 @@ func (e *ES8Indexer) EnsureIndex(ctx context.Context, dims int) error {
 		return fmt.Errorf("marshal mapping: %w", err)
 	}
 
-	res, err = e.client.Indices.Create(e.indexName, e.client.Indices.Create.WithBody(bytes.NewReader(body)))
+	res, err = e.client.Indices.Create(indexName, e.client.Indices.Create.WithBody(bytes.NewReader(body)))
 	if err != nil {
 		return fmt.Errorf("create index: %w", err)
 	}
@@ -93,7 +102,7 @@ func (e *ES8Indexer) EnsureIndex(ctx context.Context, dims int) error {
 		return fmt.Errorf("create index failed: status=%d body=%s", res.StatusCode, string(respBody))
 	}
 
-	log.Printf("Index %s created successfully", e.indexName)
+	log.Printf("Index %s created successfully", indexName)
 	return nil
 }
 
@@ -231,18 +240,23 @@ func (e *ES8Indexer) SearchHybrid(ctx context.Context, query string, queryVector
 
 // SearchWithMode performs search with explicit mode selection.
 func (e *ES8Indexer) SearchWithMode(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string) ([]SearchHit, error) {
-	return e.searchWithMode(ctx, query, queryVector, topK, minScore, mode)
+	return e.SearchWithWeights(ctx, query, queryVector, topK, minScore, mode, DefaultWeights)
 }
 
-func (e *ES8Indexer) searchWithMode(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string) ([]SearchHit, error) {
+// SearchWithWeights performs search with explicit mode and custom hybrid fusion weights.
+func (e *ES8Indexer) SearchWithWeights(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string, weights SearchWeights) ([]SearchHit, error) {
 	switch mode {
 	case "knn":
 		return e.searchKNN(ctx, queryVector, topK, minScore)
 	case "rrf":
 		return e.searchRRF(ctx, query, queryVector, topK, minScore)
 	default: // "hybrid"
-		return e.searchManualFusion(ctx, query, queryVector, topK, minScore)
+		return e.searchManualFusionWithWeights(ctx, query, queryVector, topK, minScore, weights)
 	}
+}
+
+func (e *ES8Indexer) searchWithMode(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string) ([]SearchHit, error) {
+	return e.SearchWithMode(ctx, query, queryVector, topK, minScore, mode)
 }
 
 // searchKNN performs pure KNN vector search.
@@ -353,13 +367,50 @@ func (e *ES8Indexer) searchManualFusion(ctx context.Context, query string, query
 	return fuseResults(knnRes.hits, bm25Res.hits, topK, minScore), nil
 }
 
+// searchManualFusionWithWeights is like searchManualFusion but with configurable weights.
+func (e *ES8Indexer) searchManualFusionWithWeights(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, weights SearchWeights) ([]SearchHit, error) {
+	candidateK := topK * 2
+	if candidateK < 10 {
+		candidateK = 10
+	}
+
+	type result struct {
+		hits []SearchHit
+		err  error
+	}
+	knnCh := make(chan result, 1)
+	bm25Ch := make(chan result, 1)
+
+	go func() {
+		h, err := e.searchKNN(ctx, queryVector, candidateK, 0)
+		knnCh <- result{h, err}
+	}()
+	go func() {
+		h, err := e.searchBM25(ctx, query, candidateK, 0)
+		bm25Ch <- result{h, err}
+	}()
+
+	knnRes := <-knnCh
+	bm25Res := <-bm25Ch
+
+	if knnRes.err != nil {
+		return nil, fmt.Errorf("knn search: %w", knnRes.err)
+	}
+	if bm25Res.err != nil {
+		return nil, fmt.Errorf("bm25 search: %w", bm25Res.err)
+	}
+
+	return fuseResultsWithWeights(knnRes.hits, bm25Res.hits, topK, minScore, weights), nil
+}
+
 // fuseResults merges KNN and BM25 results using RRF-like reciprocal rank fusion.
 func fuseResults(knnHits, bm25Hits []SearchHit, topK int, minScore float64) []SearchHit {
-	const (
-		vectorWeight  = 0.7
-		keywordWeight = 0.3
-		fusionK       = 60.0
-	)
+	return fuseResultsWithWeights(knnHits, bm25Hits, topK, minScore, SearchWeights{Vector: 0.7, Keyword: 0.3})
+}
+
+// fuseResultsWithWeights merges KNN and BM25 results with configurable weights.
+func fuseResultsWithWeights(knnHits, bm25Hits []SearchHit, topK int, minScore float64, weights SearchWeights) []SearchHit {
+	fusionK := 60.0
 
 	// Track best score per chunk_id
 	type candidate struct {
@@ -398,12 +449,12 @@ func fuseResults(knnHits, bm25Hits []SearchHit, topK int, minScore float64) []Se
 	for _, c := range candidates {
 		score := 0.0
 		if c.vectorRank > 0 {
-			score += vectorWeight * (1.0 / (fusionK + float64(c.vectorRank)))
-			score += vectorWeight * 0.05 * c.vectorScore
+			score += weights.Vector * (1.0 / (fusionK + float64(c.vectorRank)))
+			score += weights.Vector * 0.05 * c.vectorScore
 		}
 		if c.keywordRank > 0 {
-			score += keywordWeight * (1.0 / (fusionK + float64(c.keywordRank)))
-			score += keywordWeight * 0.05 * c.keywordScore
+			score += weights.Keyword * (1.0 / (fusionK + float64(c.keywordRank)))
+			score += weights.Keyword * 0.05 * c.keywordScore
 		}
 
 		if score < minScore {

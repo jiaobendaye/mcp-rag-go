@@ -3,11 +3,15 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/cloudwego/eino/components/document"
 	"github.com/cloudwego/eino/compose"
@@ -33,6 +37,8 @@ type Server struct {
 	embedder         rag.Embedder
 	kbs              *knowledgebase.Service
 	esIndexer        *rag.ES8Indexer
+	embedDims        int // probed embedding dimensions, used for EnsureIndex on new KBs
+	classifier        *rag.QueryClassifier
 	mcpSrv           *mcpserver.MCPServer
 	mcpHandler       *mcpserver.StreamableHTTPServer
 }
@@ -49,6 +55,7 @@ func New(
 	embedder rag.Embedder,
 	kbs *knowledgebase.Service,
 	esIndexer *rag.ES8Indexer,
+	embedDims int,
 ) *Server {
 	return &Server{
 		cfg:              cfg,
@@ -61,6 +68,8 @@ func New(
 		embedder:         embedder,
 		kbs:              kbs,
 		esIndexer:        esIndexer,
+		embedDims:        embedDims,
+		classifier:        rag.NewQueryClassifier(),
 	}
 }
 
@@ -174,6 +183,43 @@ func parseIntPtr(s string) *int64 {
 	return &v
 }
 
+// parseKBIDs parses kb_ids from various formats (comma-separated string, JSON array, int).
+func parseKBIDs(raw any) []int64 {
+	if raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case string:
+		var ids []int64
+		for _, part := range strings.Split(v, ",") {
+			trimmed := strings.TrimSpace(part)
+			if id, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+				ids = append(ids, id)
+			}
+		}
+		return ids
+	case []any:
+		var ids []int64
+		for _, item := range v {
+			switch n := item.(type) {
+			case float64:
+				ids = append(ids, int64(n))
+			case int64:
+				ids = append(ids, n)
+			case int:
+				ids = append(ids, int64(n))
+			case string:
+				if id, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64); err == nil {
+					ids = append(ids, id)
+				}
+			}
+		}
+		return ids
+	default:
+		return nil
+	}
+}
+
 func strPtr(s string) *string {
 	if s == "" {
 		return nil
@@ -183,23 +229,7 @@ func strPtr(s string) *string {
 
 // health responds with structured service status (compatible with Python format).
 func (s *Server) health(c *gin.Context) {
-	// Build runtime info (mirrors Python format)
-	runtime := gin.H{
-		"embedding_model": gin.H{
-			"provider": s.cfg.EmbeddingProvider,
-			"model":    s.cfg.EmbeddingModel,
-		},
-		"llm_model": gin.H{
-			"provider": s.cfg.LLMProvider,
-			"model":    s.cfg.LLMModel,
-		},
-		"vector_store": gin.H{
-			"type": "elasticsearch",
-		},
-		"knowledge_base": gin.H{
-			"type": "sqlite",
-		},
-	}
+	runtime := s.buildRuntimeSnapshot()
 
 	revision := int64(0)
 	if s.configManager != nil {
@@ -245,19 +275,8 @@ func (s *Server) health(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// metrics returns the full metrics snapshot.
-func (s *Server) metrics(c *gin.Context) {
-	if s.metricsCollector == nil {
-		c.JSON(http.StatusOK, gin.H{"error": "metrics collector not configured"})
-		return
-	}
-	snap := s.metricsCollector.Snapshot()
-	c.JSON(http.StatusOK, snap)
-}
-
-// ready checks component-level readiness (compatible with Python format).
-func (s *Server) ready(c *gin.Context) {
-	// Build runtime info
+// buildRuntimeSnapshot builds the full 7-component runtime object.
+func (s *Server) buildRuntimeSnapshot() gin.H {
 	runtime := gin.H{
 		"embedding_model": gin.H{
 			"provider": s.cfg.EmbeddingProvider,
@@ -275,6 +294,50 @@ func (s *Server) ready(c *gin.Context) {
 		},
 	}
 
+	// document_processor
+	if s.chain != nil {
+		runtime["document_processor"] = "ready"
+	} else {
+		runtime["document_processor"] = nil
+	}
+
+	// hybrid_service
+	if s.searcher != nil {
+		runtime["hybrid_service"] = "ready"
+	} else {
+		runtime["hybrid_service"] = nil
+	}
+
+	// retrieval_cache
+	if s.retrievalCache != nil {
+		runtime["retrieval_cache"] = s.retrievalCache.Stats()
+	} else {
+		runtime["retrieval_cache"] = nil
+	}
+
+	// provider_budget (not yet implemented)
+	runtime["provider_budget"] = gin.H{
+		"enabled": false,
+		"reason":  "not yet implemented",
+	}
+
+	return runtime
+}
+
+// metrics returns the full metrics snapshot.
+func (s *Server) metrics(c *gin.Context) {
+	if s.metricsCollector == nil {
+		c.JSON(http.StatusOK, gin.H{"error": "metrics collector not configured"})
+		return
+	}
+	snap := s.metricsCollector.Snapshot()
+	c.JSON(http.StatusOK, snap)
+}
+
+// ready checks component-level readiness (compatible with Python format).
+func (s *Server) ready(c *gin.Context) {
+	runtime := s.buildRuntimeSnapshot()
+
 	revision := int64(0)
 	if s.configManager != nil {
 		revision = s.configManager.Revision()
@@ -282,9 +345,14 @@ func (s *Server) ready(c *gin.Context) {
 
 	bootstrapped := s.embedder != nil && s.esIndexer != nil && s.kbs != nil
 	ready := bootstrapped
+	reasons := []string{}
+	if !bootstrapped {
+		reasons = append(reasons, "service not fully bootstrapped")
+	}
 	if ready && s.esIndexer != nil {
 		if err := s.esIndexer.HealthCheck(context.Background()); err != nil {
 			ready = false
+			reasons = append(reasons, "elasticsearch not reachable")
 		}
 	}
 
@@ -293,6 +361,9 @@ func (s *Server) ready(c *gin.Context) {
 		"ready":           ready,
 		"runtime":         runtime,
 		"config_revision": revision,
+	}
+	if len(reasons) > 0 {
+		resp["reasons"] = reasons
 	}
 
 	status := http.StatusOK
@@ -677,19 +748,36 @@ func (s *Server) createKnowledgeBase(c *gin.Context) {
 	if req.Scope == "" {
 		req.Scope = "public"
 	}
-	kb, err := s.kbs.Resolve(knowledgebase.ResolveRequest{
-		Scope: &req.Scope, UserID: req.OwnerUserID, AgentID: req.OwnerAgentID,
-		LegacyCollection: &req.Name,
-	})
+
+	legacyKey := fmt.Sprintf("legacy:%s:%s", req.Scope, req.Name)
+
+	// Try find existing KB by legacy key
+	kb, err := s.kbs.GetByLegacyKey(legacyKey)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
-	// Ensure ES index exists
-	dims := 1024 // default, will be probed later
-	s.kbs.EnsurePublicDefault() // ensure at least public default
-	_ = dims
-	c.JSON(http.StatusOK, kb.KnowledgeBase)
+	if kb != nil {
+		c.JSON(http.StatusOK, kb)
+		return
+	}
+
+	// Create new KB
+	kb, err = s.kbs.Create(req.Name, req.Scope, req.OwnerUserID, req.OwnerAgentID, &legacyKey)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+
+	// Ensure ES index for the new KB (non-fatal on failure)
+	if s.esIndexer != nil && s.embedDims > 0 {
+		indexName := kb.IndexName()
+		if err := s.esIndexer.EnsureIndexForKB(c.Request.Context(), indexName, s.embedDims); err != nil {
+			log.Printf("WARNING: Failed to create ES index %s for KB %d: %v", indexName, kb.ID, err)
+		}
+	}
+
+	c.JSON(http.StatusOK, kb)
 }
 
 // listCollections returns legacy collection names (backward compat).
@@ -859,6 +947,27 @@ func (s *Server) search(c *gin.Context) {
 		}
 	}
 
+	// Check for kb_ids (multi-KB aggregation)
+	kbIDsRaw := c.Query("kb_ids")
+	if kbIDsRaw == "" {
+		kbIDsRaw = c.Query("kb_ids[]") // query array style
+	}
+
+	var kbIDs []int64
+	if kbIDsRaw != "" {
+		for _, part := range strings.Split(kbIDsRaw, ",") {
+			trimmed := strings.TrimSpace(part)
+			if id, err := strconv.ParseInt(trimmed, 10, 64); err == nil && id > 0 {
+				kbIDs = append(kbIDs, id)
+			}
+		}
+	}
+
+	if len(kbIDs) > 0 {
+		s.searchMultiKB(c, query, kbIDs, limit)
+		return
+	}
+
 	// Resolve KB
 	resolution, indexName, err := s.resolveKB(c)
 	if err != nil {
@@ -959,6 +1068,125 @@ func (s *Server) search(c *gin.Context) {
 	c.JSON(http.StatusOK, searchResp)
 }
 
+// searchMultiKB performs parallel search across multiple knowledge bases and aggregates results.
+func (s *Server) searchMultiKB(c *gin.Context, query string, kbIDs []int64, limit int) {
+	ctx := c.Request.Context()
+
+	// Resolve each kb_id to index name, dedupe by index
+	type kbInfo struct {
+		kb           *knowledgebase.KnowledgeBase
+		indexName    string
+	}
+	seen := map[string]bool{}
+	var kbs []kbInfo
+	for _, id := range kbIDs {
+		resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{KBID: &id})
+		if err != nil {
+			continue // skip unresolvable KBs
+		}
+		indexName := resolution.KnowledgeBase.IndexName()
+		if seen[indexName] {
+			continue
+		}
+		seen[indexName] = true
+		kbs = append(kbs, kbInfo{resolution.KnowledgeBase, indexName})
+	}
+
+	if len(kbs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "no valid knowledge bases found"})
+		return
+	}
+
+	// Embed query once
+	vecs, err := s.embedder.EmbedStrings(ctx, []string{query})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	queryVec := toFloat32(vecs[0])
+
+	// Parallel search (max 10 goroutines)
+	type searchResult struct {
+		idx  int
+		hits []rag.SearchHit
+		err  error
+	}
+	results := make([]searchResult, len(kbs))
+	var wg sync.WaitGroup
+	concurrency := len(kbs)
+	if concurrency > 10 {
+		concurrency = 10
+	}
+	sem := make(chan struct{}, concurrency)
+
+	for i, kb := range kbs {
+		wg.Add(1)
+		go func(idx int, idxName string, info kbInfo) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			hits, err := s.searchWithClassifier(ctx, query, queryVec, limit, s.cfg.MinScore, s.cfg.SearchMode)
+			results[idx] = searchResult{idx: idx, hits: hits, err: err}
+		}(i, kb.indexName, kb)
+	}
+	wg.Wait()
+
+	// Collect results
+	var kbResults []rag.KBSearchResult
+	for i, info := range kbs {
+		r := results[i]
+		if r.err != nil {
+			continue
+		}
+		var ownerUserID, ownerAgentID *int64
+		if info.kb.OwnerUserID != nil {
+			v := *info.kb.OwnerUserID
+			ownerUserID = &v
+		}
+		if info.kb.OwnerAgentID != nil {
+			v := *info.kb.OwnerAgentID
+			ownerAgentID = &v
+		}
+		kbResults = append(kbResults, rag.KBSearchResult{
+			KBID:         info.kb.ID,
+			KBName:       info.kb.Name,
+			KBScope:      string(info.kb.Scope),
+			OwnerUserID:  ownerUserID,
+			OwnerAgentID: ownerAgentID,
+			Hits:         r.hits,
+		})
+	}
+
+	aggregated := rag.AggregateResults(kbResults, limit)
+
+	// Convert to gin.H for JSON
+	ginResults := make([]gin.H, len(aggregated))
+	for i, ar := range aggregated {
+		ginResults[i] = gin.H{
+			"content":          ar.Content,
+			"score":            ar.Score,
+			"source":           ar.Source,
+			"filename":         ar.Filename,
+			"metadata": gin.H{
+				"knowledge_base_id":    ar.KBID,
+				"knowledge_base_name":  ar.KBName,
+				"knowledge_base_scope": ar.KBScope,
+				"owner_user_id":        ar.OwnerUserID,
+				"owner_agent_id":       ar.OwnerAgentID,
+			},
+			"vector_score":     ar.VectorScore,
+			"keyword_score":    ar.KeywordScore,
+			"retrieval_method": ar.RetrievalMethod,
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"query":      query,
+		"collection": "multi_kb",
+		"results":    ginResults,
+	})
+}
+
 // chat handles RAG-based conversation.
 func (s *Server) chat(c *gin.Context) {
 	var req rag.ChatRequest
@@ -968,6 +1196,12 @@ func (s *Server) chat(c *gin.Context) {
 	}
 	if req.Query == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "query is required"})
+		return
+	}
+
+	// Multi-KB mode
+	if len(req.KBIDs) > 0 {
+		s.chatMultiKB(c, &req)
 		return
 	}
 
@@ -985,6 +1219,111 @@ func (s *Server) chat(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// chatMultiKB handles chat requests across multiple KBs.
+func (s *Server) chatMultiKB(c *gin.Context, req *rag.ChatRequest) {
+	// Use the multi-KB search helper
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 5
+	}
+
+	// Resolve KBs
+	type kbInfo struct {
+		kb        *knowledgebase.KnowledgeBase
+		indexName string
+	}
+	seen := map[string]bool{}
+	var kbs []kbInfo
+	for _, id := range req.KBIDs {
+		resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{KBID: &id})
+		if err != nil {
+			continue
+		}
+		indexName := resolution.KnowledgeBase.IndexName()
+		if seen[indexName] {
+			continue
+		}
+		seen[indexName] = true
+		kbs = append(kbs, kbInfo{resolution.KnowledgeBase, indexName})
+	}
+
+	if len(kbs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "no valid knowledge bases found"})
+		return
+	}
+
+	// Embed once
+	vecs, err := s.embedder.EmbedStrings(c.Request.Context(), []string{req.Query})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	queryVec := toFloat32(vecs[0])
+
+	// Parallel search
+	type searchResult struct {
+		hits []rag.SearchHit
+		err  error
+	}
+	results := make([]searchResult, len(kbs))
+	var wg sync.WaitGroup
+	for i, kb := range kbs {
+		wg.Add(1)
+		go func(idx int, info kbInfo) {
+			defer wg.Done()
+			hits, err := s.searchWithClassifier(c.Request.Context(), req.Query, queryVec, limit, s.cfg.MinScore, s.cfg.SearchMode)
+			results[idx] = searchResult{hits: hits, err: err}
+		}(i, kb)
+	}
+	wg.Wait()
+
+	// Collect and aggregate
+	var kbResults []rag.KBSearchResult
+	for i, info := range kbs {
+		r := results[i]
+		if r.err != nil {
+			continue
+		}
+		kbResults = append(kbResults, rag.KBSearchResult{
+			KBID:         info.kb.ID,
+			KBName:       info.kb.Name,
+			KBScope:      string(info.kb.Scope),
+			OwnerUserID:  info.kb.OwnerUserID,
+			OwnerAgentID: info.kb.OwnerAgentID,
+			Hits:         r.hits,
+		})
+	}
+
+	if len(kbResults) == 0 {
+		c.JSON(http.StatusOK, rag.ChatResponse{
+			Query:      req.Query,
+			Collection: "multi_kb",
+			Response:   "未找到相关信息。",
+		})
+		return
+	}
+
+	// Build merged context for LLM
+	aggregated := rag.AggregateResults(kbResults, limit)
+	var contextBuilder strings.Builder
+	for idx, ar := range aggregated {
+		contextBuilder.WriteString(fmt.Sprintf("文档%d (相似度: %.3f, 知识库: %s):\n%s\n\n",
+			idx+1, ar.Score, ar.KBName, ar.Content))
+	}
+
+	// Call LLM with pre-built context
+	req.PreRetrievedContext = contextBuilder.String()
+	req.Collection = "multi_kb"
+	resp, err := s.chatSvc.Chat(c.Request.Context(), req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	resp.Collection = "multi_kb"
 
 	c.JSON(http.StatusOK, resp)
 }
@@ -1049,4 +1388,16 @@ func toFloat32(f64 []float64) []float32 {
 		result[i] = float32(v)
 	}
 	return result
+}
+
+// searchWithClassifier performs search with adaptive weights from the query classifier.
+// When searchMode is "hybrid", it classifies the query and uses intent-aware weights.
+// For "knn" and "rrf" modes, weights are ignored.
+func (s *Server) searchWithClassifier(ctx context.Context, query string, vec []float32, topK int, minScore float64, mode string) ([]rag.SearchHit, error) {
+	if mode == "hybrid" && s.classifier != nil {
+		classification := s.classifier.Classify(query)
+		weights := rag.GetWeights(classification.PrimaryIntent)
+		return s.searcher.SearchWithWeights(ctx, query, vec, topK, minScore, mode, weights)
+	}
+	return s.searcher.SearchWithMode(ctx, query, vec, topK, minScore, mode)
 }

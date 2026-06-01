@@ -45,6 +45,16 @@ func (s *Service) EnsureAgentPrivateDefault(userID, agentID int64) (*KnowledgeBa
 	)
 }
 
+// GetByLegacyKey looks up a knowledge base by its legacy collection key.
+func (s *Service) GetByLegacyKey(key string) (*KnowledgeBase, error) {
+	return s.store.GetByLegacyKey(key)
+}
+
+// Create inserts a new knowledge base with the given parameters.
+func (s *Service) Create(name, scope string, ownerUserID, ownerAgentID *int64, legacyKey *string) (*KnowledgeBase, error) {
+	return s.store.Create(name, scope, ownerUserID, ownerAgentID, legacyKey)
+}
+
 // ListAccessible returns all KBs accessible to the given user, including defaults.
 func (s *Service) ListAccessible(userID *int64) ([]*KnowledgeBase, error) {
 	kbs, err := s.store.ListAccessible(userID)

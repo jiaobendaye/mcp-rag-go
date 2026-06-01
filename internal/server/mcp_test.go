@@ -68,6 +68,10 @@ func (m *mcpTestSearcher) SearchWithMode(ctx context.Context, q string, qv []flo
 	return m.SearchHybrid(ctx, q, qv, tk, ms)
 }
 
+func (m *mcpTestSearcher) SearchWithWeights(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string, weights rag.SearchWeights) ([]rag.SearchHit, error) {
+	return m.SearchWithMode(ctx, query, queryVector, topK, minScore, mode)
+}
+
 // setupMCPServer creates a test Server with MCP support.
 func setupMCPServer(t *testing.T) *gin.Engine {
 	t.Helper()
@@ -88,7 +92,7 @@ func setupMCPServer(t *testing.T) *gin.Engine {
 	searcher := &mcpTestSearcher{}
 	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{}, nil)
 
-	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil)
+	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil, 0)
 	return s.Setup()
 }
 
@@ -110,7 +114,7 @@ func TestMCPRagAskParameterParsing(t *testing.T) {
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
 	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{}, nil)
-	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil)
+	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil, 0)
 
 	// Init MCP server (stores mcpSrv on the Server)
 	s.mcpSrv, s.mcpHandler = s.InitMCP()
@@ -265,7 +269,7 @@ func TestMCPToolsRegistered(t *testing.T) {
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
 	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{}, nil)
-	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil)
+	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil, 0)
 	s.mcpSrv, s.mcpHandler = s.InitMCP()
 
 	tools := s.mcpSrv.ListTools()

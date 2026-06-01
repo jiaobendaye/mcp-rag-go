@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -63,6 +64,9 @@ func (s *Server) InitMCP() (*mcpserver.MCPServer, *mcpserver.StreamableHTTPServe
 		mcp.WithString("trace_id",
 			mcp.Description("追踪ID (用于分布式追踪)"),
 		),
+		mcp.WithArray("kb_ids",
+			mcp.Description("多知识库ID列表，用于跨知识库聚合检索"),
+		),
 	)
 
 	mcpSrv.AddTool(tool, s.handleRagAsk)
@@ -86,6 +90,8 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 
 	// Extract KB parameters
 	kbID := request.GetInt("kb_id", 0)
+	kbIDsRaw := extractKBIDsArg(request.Params.Arguments)
+	kbIDs := mcpExtractKBIDs(kbIDsRaw)
 	scope := request.GetString("scope", "")
 	userID := request.GetInt("user_id", 0)
 	agentID := request.GetInt("agent_id", 0)
@@ -105,6 +111,11 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 	}
 	if threshold > 1 {
 		threshold = 1
+	}
+
+	// Multi-KB mode
+	if len(kbIDs) > 0 {
+		return s.handleRagAskMultiKB(ctx, query, mode, kbIDs, limit, threshold)
 	}
 
 	// Resolve KB to get index name
@@ -298,4 +309,134 @@ func (s *Server) mcpDebugCall(c *gin.Context) {
 		"is_error": false,
 		"content":  strings.Join(texts, "\n"),
 	})
+}
+
+// extractKBIDsArg extracts kb_ids from the raw MCP arguments (which is typed as `any`).
+func extractKBIDsArg(args any) any {
+	m, ok := args.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return m["kb_ids"]
+}
+
+// mcpExtractKBIDs extracts kb_ids from various MCP argument formats.
+func mcpExtractKBIDs(raw any) []int64 {
+	if raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []any:
+		var ids []int64
+		for _, item := range v {
+			switch n := item.(type) {
+			case float64:
+				ids = append(ids, int64(n))
+			case int64:
+				ids = append(ids, n)
+			case int:
+				ids = append(ids, int64(n))
+			}
+		}
+		return ids
+	case string:
+		return parseKBIDs(v)
+	}
+	return nil
+}
+
+// handleRagAskMultiKB performs multi-KB retrieval for MCP rag_ask.
+func (s *Server) handleRagAskMultiKB(ctx context.Context, query string, mode string, kbIDs []int64, limit int, threshold float64) (*mcp.CallToolResult, error) {
+	// Resolve KBs
+	type kbInfo struct {
+		kb        *knowledgebase.KnowledgeBase
+		indexName string
+	}
+	seen := map[string]bool{}
+	var kbs []kbInfo
+	for _, id := range kbIDs {
+		resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{KBID: &id})
+		if err != nil {
+			continue
+		}
+		indexName := resolution.KnowledgeBase.IndexName()
+		if seen[indexName] {
+			continue
+		}
+		seen[indexName] = true
+		kbs = append(kbs, kbInfo{resolution.KnowledgeBase, indexName})
+	}
+
+	if len(kbs) == 0 {
+		return mcp.NewToolResultError("no valid knowledge bases found"), nil
+	}
+
+	// Embed once
+	vecs, err := s.embedder.EmbedStrings(ctx, []string{query})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("向量化失败: %v", err)), nil
+	}
+	queryVec := toFloat32(vecs[0])
+
+	// Parallel search
+	type searchResult struct {
+		hits []rag.SearchHit
+		err  error
+	}
+	results := make([]searchResult, len(kbs))
+	var wg sync.WaitGroup
+	for i, kb := range kbs {
+		wg.Add(1)
+		go func(idx int, info kbInfo) {
+			defer wg.Done()
+			hits, err := s.searcher.SearchWithMode(ctx, query, queryVec, limit, threshold, s.cfg.SearchMode)
+			results[idx] = searchResult{hits: hits, err: err}
+		}(i, kb)
+	}
+	wg.Wait()
+
+	// Collect and aggregate
+	var kbResults []rag.KBSearchResult
+	for i, info := range kbs {
+		r := results[i]
+		if r.err != nil {
+			continue
+		}
+		kbResults = append(kbResults, rag.KBSearchResult{
+			KBID:         info.kb.ID,
+			KBName:       info.kb.Name,
+			KBScope:      string(info.kb.Scope),
+			OwnerUserID:  info.kb.OwnerUserID,
+			OwnerAgentID: info.kb.OwnerAgentID,
+			Hits:         r.hits,
+		})
+	}
+
+	aggregated := rag.AggregateResults(kbResults, limit)
+
+	if len(aggregated) == 0 {
+		return mcp.NewToolResultText(fmt.Sprintf("未找到与 \"%s\" 相关的信息。", query)), nil
+	}
+
+	// Format results
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("查询: %s\n", query))
+	sb.WriteString(fmt.Sprintf("模式: 跨%d个知识库检索 (共%d条结果)\n\n", len(kbIDs), len(aggregated)))
+	for i, ar := range aggregated {
+		sb.WriteString(fmt.Sprintf("--- 结果 %d (相似度: %.3f, 知识库: %s) ---\n", i+1, ar.Score, ar.KBName))
+		if ar.Filename != "" {
+			sb.WriteString(fmt.Sprintf("文件: %s\n", ar.Filename))
+		}
+		if ar.Source != "" {
+			sb.WriteString(fmt.Sprintf("来源: %s\n", ar.Source))
+		}
+		sb.WriteString(fmt.Sprintf("\n%s\n\n", ar.Content))
+	}
+
+	if mode == "summary" {
+		sb.WriteString("--- 摘要模式 ---\n")
+		sb.WriteString("跨知识库摘要生成功能暂未启用。")
+	}
+
+	return mcp.NewToolResultText(sb.String()), nil
 }

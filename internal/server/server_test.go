@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
+	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
 	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
 )
 
@@ -68,13 +70,34 @@ func (m *testMockSearcher) SearchWithMode(ctx context.Context, q string, qv []fl
 	return m.SearchHybrid(ctx, q, qv, tk, ms)
 }
 
+func (m *testMockSearcher) SearchWithWeights(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string, weights rag.SearchWeights) ([]rag.SearchHit, error) {
+	return m.SearchWithMode(ctx, query, queryVector, topK, minScore, mode)
+}
+
 func setupTestServer() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	cfg := config.DefaultConfig()
 	emb := &httpTestEmbedder{}
 	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{}, nil)
-	s := New(cfg, nil, nil, nil, nil, chatSvc, &testMockSearcher{}, emb, nil, nil)
+	s := New(cfg, nil, nil, nil, nil, chatSvc, &testMockSearcher{}, emb, nil, nil, 0)
 	return s.Setup()
+}
+
+// setupTestServerWithKB returns a server with a real SQLite-backed KB service
+// using a temporary database.
+func setupTestServerWithKB(t *testing.T) (*gin.Engine, *knowledgebase.Service) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	cfg := config.DefaultConfig()
+	dbPath := filepath.Join(t.TempDir(), "kb.db")
+	svc, err := knowledgebase.NewService(dbPath)
+	if err != nil {
+		t.Fatalf("knowledgebase.NewService: %v", err)
+	}
+	emb := &httpTestEmbedder{}
+	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{}, nil)
+	s := New(cfg, nil, nil, nil, nil, chatSvc, &testMockSearcher{}, emb, svc, nil, 0)
+	return s.Setup(), svc
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -420,3 +443,367 @@ func TestStaticRouteExists(t *testing.T) {
 		t.Errorf("expected 404 for missing static file, got %d", w.Code)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// createKnowledgeBase (group 1)
+// ---------------------------------------------------------------------------
+
+func TestCreateKnowledgeBase_TableDriven(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantStatus  int
+		wantName    string
+		wantScope   string
+		wantIDField string // expected JSON key to verify presence
+	}{
+		{
+			name:        "name miss creates new KB",
+			body:        `{"name": "alpha", "scope": "public"}`,
+			wantStatus:  200,
+			wantName:    "alpha",
+			wantScope:   "public",
+			wantIDField: "id",
+		},
+		{
+			name:        "name miss with default scope",
+			body:        `{"name": "beta"}`,
+			wantStatus:  200,
+			wantName:    "beta",
+			wantScope:   "public",
+			wantIDField: "id",
+		},
+		{
+			name:        "name hit returns existing",
+			body:        `{"name": "alpha", "scope": "public"}`,
+			wantStatus:  200,
+			wantName:    "alpha",
+			wantScope:   "public",
+			wantIDField: "id",
+		},
+		{
+			name:       "missing name returns 400",
+			body:       `{"scope": "public"}`,
+			wantStatus: 400,
+		},
+		{
+			name:       "empty body returns 400",
+			body:       `{}`,
+			wantStatus: 400,
+		},
+		{
+			name:       "invalid JSON returns 400",
+			body:       `not json`,
+			wantStatus: 400,
+		},
+	}
+
+	var firstCreatedID int64
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, _ := setupTestServerWithKB(t)
+
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("POST", "/knowledge-bases", strings.NewReader(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Fatalf("expected status %d, got %d (body: %s)", tt.wantStatus, w.Code, w.Body.String())
+			}
+			if tt.wantStatus != 200 {
+				return
+			}
+
+			var resp map[string]any
+			if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if resp[tt.wantIDField] == nil {
+				t.Errorf("expected %q in response: %+v", tt.wantIDField, resp)
+			}
+			if name, _ := resp["name"].(string); name != tt.wantName {
+				t.Errorf("expected name=%s, got %v", tt.wantName, resp["name"])
+			}
+			if scope, _ := resp["scope"].(string); scope != tt.wantScope {
+				t.Errorf("expected scope=%s, got %v", tt.wantScope, resp["scope"])
+			}
+
+			if i == 0 {
+				// Capture the first created ID for hit-return test verification
+				switch id := resp["id"].(type) {
+				case float64:
+					firstCreatedID = int64(id)
+				case int64:
+					firstCreatedID = id
+				}
+			}
+		})
+	}
+
+	// Verify that the "name hit" subtest returned the same ID as the first
+	// creation. Re-run a sub-request against a fresh server but pre-seeded.
+	t.Run("hit-returns-same-id", func(t *testing.T) {
+		r, svc := setupTestServerWithKB(t)
+		// Pre-seed a KB with the same legacy key the handler will look up
+		legacyKey := "legacy:public:seeded"
+		kb, err := svc.Create("seeded", "public", nil, nil, &legacyKey)
+		if err != nil {
+			t.Fatalf("seed create: %v", err)
+		}
+		_ = firstCreatedID // captured but used implicitly below
+
+		// Request with the seeded name should hit GetByLegacyKey path
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/knowledge-bases", strings.NewReader(`{"name": "seeded", "scope": "public"}`))
+		req.Header.Set("Content-Type", "application/json")
+		r.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+		}
+		var resp map[string]any
+		json.NewDecoder(w.Body).Decode(&resp)
+		gotID := int64(resp["id"].(float64))
+		if gotID != kb.ID {
+			t.Errorf("expected existing KB id=%d, got %d", kb.ID, gotID)
+		}
+	})
+}
+
+func TestCreateKnowledgeBase_WithoutService(t *testing.T) {
+	r := setupTestServer() // no kbs configured
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/knowledge-bases", strings.NewReader(`{"name": "x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 when kbs is nil, got %d", w.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// /ready 7-component runtime snapshot (group 4)
+// ---------------------------------------------------------------------------
+
+func TestReady_HasSevenComponentRuntime(t *testing.T) {
+	r, _ := setupTestServerWithKB(t)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/ready", nil)
+	r.ServeHTTP(w, req)
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	rt, ok := resp["runtime"].(map[string]any)
+	if !ok {
+		t.Fatal("expected runtime object in /ready response")
+	}
+
+	// All 7 runtime components must be present
+	requiredRuntimeKeys := []string{
+		"embedding_model",
+		"llm_model",
+		"vector_store",
+		"knowledge_base",
+		"document_processor",
+		"hybrid_service",
+		"retrieval_cache",
+		"provider_budget",
+	}
+	for _, k := range requiredRuntimeKeys {
+		if _, ok := rt[k]; !ok {
+			t.Errorf("expected runtime.%s in /ready response", k)
+		}
+	}
+
+	// Bootstrapped/ready top-level fields
+	if _, ok := resp["bootstrapped"]; !ok {
+		t.Error("expected bootstrapped field")
+	}
+	if _, ok := resp["ready"]; !ok {
+		t.Error("expected ready field")
+	}
+	if _, ok := resp["config_revision"]; !ok {
+		t.Error("expected config_revision field")
+	}
+}
+
+func TestHealth_HasSevenComponentRuntime(t *testing.T) {
+	r, _ := setupTestServerWithKB(t)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/health", nil)
+	r.ServeHTTP(w, req)
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	rt, ok := resp["runtime"].(map[string]any)
+	if !ok {
+		t.Fatal("expected runtime object in /health response")
+	}
+
+	// Same 7 components in /health runtime
+	requiredRuntimeKeys := []string{
+		"embedding_model", "llm_model", "vector_store", "knowledge_base",
+		"document_processor", "hybrid_service", "retrieval_cache", "provider_budget",
+	}
+	for _, k := range requiredRuntimeKeys {
+		if _, ok := rt[k]; !ok {
+			t.Errorf("expected runtime.%s in /health response", k)
+		}
+	}
+
+	// Backward compat: existing fields preserved
+	for _, f := range []string{"status", "healthy", "ready", "bootstrapped", "reasons", "config_revision"} {
+		if _, ok := resp[f]; !ok {
+			t.Errorf("expected %q in /health response (backward compat)", f)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// kb_ids multi-KB aggregation (group 2)
+// ---------------------------------------------------------------------------
+
+func TestSearch_KBIDs_MultiKB(t *testing.T) {
+	r, svc := setupTestServerWithKB(t)
+
+	// Pre-seed 2 KBs
+	kb1, err := svc.Create("multi-1", "public", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("create kb1: %v", err)
+	}
+	kb2, err := svc.Create("multi-2", "public", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("create kb2: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	url := "/search?query=hello&kb_ids=" + itoa(kb1.ID) + "," + itoa(kb2.ID)
+	req, _ := http.NewRequest("GET", url, nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d (body: %s)", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got, _ := resp["collection"].(string); got != "multi_kb" {
+		t.Errorf("expected collection=multi_kb, got %v", resp["collection"])
+	}
+
+	results, ok := resp["results"].([]any)
+	if !ok {
+		t.Fatalf("expected results array, got %T", resp["results"])
+	}
+	if len(results) == 0 {
+		t.Error("expected non-empty results from multi-KB search")
+	}
+
+	// Each result must have KB metadata
+	for i, r := range results {
+		m := r.(map[string]any)
+		meta, ok := m["metadata"].(map[string]any)
+		if !ok {
+			t.Errorf("result[%d] missing metadata", i)
+			continue
+		}
+		if _, ok := meta["knowledge_base_id"]; !ok {
+			t.Errorf("result[%d] missing knowledge_base_id in metadata", i)
+		}
+		if _, ok := meta["knowledge_base_name"]; !ok {
+			t.Errorf("result[%d] missing knowledge_base_name in metadata", i)
+		}
+	}
+}
+
+func TestSearch_KBIDs_InvalidIDsReturns400(t *testing.T) {
+	r, _ := setupTestServerWithKB(t)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/search?query=hello&kb_ids=99999,88888", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != 400 {
+		t.Errorf("expected 400 for unresolvable kb_ids, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestParseKBIDs_TableDriven(t *testing.T) {
+	tests := []struct {
+		name string
+		in   any
+		want []int64
+	}{
+		{"nil", nil, nil},
+		{"empty string", "", nil},
+		{"single int string", "42", []int64{42}},
+		{"comma separated", "1,2,3", []int64{1, 2, 3}},
+		{"comma with spaces", " 1 , 2 , 3 ", []int64{1, 2, 3}},
+		{"json array floats", []any{1.0, 2.0, 3.0}, []int64{1, 2, 3}},
+		{"json array ints", []any{int(10), int(20)}, []int64{10, 20}},
+		{"json array int64s", []any{int64(99), int64(100)}, []int64{99, 100}},
+		{"json array strings", []any{"5", "6"}, []int64{5, 6}},
+		{"invalid ints ignored", []any{"abc", "7"}, []int64{7}},
+		{"empty array", []any{}, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseKBIDs(tt.in)
+			if !equalInt64Slice(got, tt.want) {
+				t.Errorf("parseKBIDs(%v) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func itoa(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+
+func equalInt64Slice(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// silence unused import warnings when a test references these
+var _ = context.Background

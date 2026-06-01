@@ -58,6 +58,7 @@ type Searcher interface {
 	Search(ctx context.Context, queryVector []float32, topK int, minScore float64) ([]SearchHit, error)
 	SearchHybrid(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error)
 	SearchWithMode(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string) ([]SearchHit, error)
+	SearchWithWeights(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string, weights SearchWeights) ([]SearchHit, error)
 }
 
 // HealthChecker wraps a health check for external services.

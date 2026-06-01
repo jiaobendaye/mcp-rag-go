@@ -44,6 +44,10 @@ func (m *mockRetrieverSearcher) SearchWithMode(ctx context.Context, query string
 	return nil, nil
 }
 
+func (m *mockRetrieverSearcher) SearchWithWeights(ctx context.Context, query string, queryVector []float32, topK int, minScore float64, mode string, weights SearchWeights) ([]SearchHit, error) {
+	return m.SearchWithMode(ctx, query, queryVector, topK, minScore, mode)
+}
+
 func TestESRetrieverRetrieve(t *testing.T) {
 	t.Run("basic retrieval", func(t *testing.T) {
 		emb := &mockRetrieverEmbedder{}
