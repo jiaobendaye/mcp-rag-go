@@ -216,3 +216,20 @@ func TestEnvVarOverride_LegacyESIndexIsIgnored(t *testing.T) {
 		t.Errorf("expected HTTPPort=9090, got %d", cfg.HTTPPort)
 	}
 }
+
+func TestEnvVarOverride_LLMApiKey(t *testing.T) {
+	// Regression: the production config.yaml must NOT contain a literal
+	// API key (it was leaked to git history once). The LLM key is now
+	// supplied exclusively via the MCP_RAG_LLM_API_KEY env var (e.g.,
+	// loaded from .env). This test pins that contract.
+	t.Setenv("MCP_RAG_LLM_API_KEY", "sk-from-env-test-key-12345")
+	t.Setenv("OPENAI_API_KEY", "") // don't pollute
+
+	cfg, err := Load("/nonexistent/path")
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if cfg.LLMAPIKey != "sk-from-env-test-key-12345" {
+		t.Errorf("expected LLMAPIKey from env var, got %q", cfg.LLMAPIKey)
+	}
+}

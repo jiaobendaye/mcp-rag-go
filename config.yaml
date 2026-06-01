@@ -17,7 +17,7 @@ embedding_base_url: "http://localhost:11434/v1"
 llm_provider: "openai"
 llm_model: "deepseek-v4-flash"
 llm_base_url: "https://zhi8.xf.bj.cn/onehub/v1"
-llm_api_key: "sk-A6sz1HQ6DpsIjwn_UH5vg6J9EuEDb9camoQip5Wzbfc5NtDv59Jh0YtBIIQ"
+# llm_api_key: set via MCP_RAG_LLM_API_KEY env var (see .env)
 
 # RAG Parameters
 chunk_size: 4000       # characters per chunk
