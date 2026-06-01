@@ -17,10 +17,10 @@ func setupSecureServer(securityCfg *config.Config) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 
 	emb := &httpTestEmbedder{}
-	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{})
+	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{}, nil)
 	searcher := &testMockSearcher{}
 
-	s := New(securityCfg, nil, chatSvc, searcher, emb, nil, nil)
+	s := New(securityCfg, nil, nil, nil, nil, chatSvc, searcher, emb, nil, nil)
 	return s.Setup()
 }
 

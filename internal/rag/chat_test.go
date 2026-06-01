@@ -36,7 +36,7 @@ func TestChat(t *testing.T) {
 		}
 		llm := &mockLLM{}
 
-		svc := NewChatService(searcher, emb, llm)
+		svc := NewChatService(searcher, emb, llm, nil)
 		resp, err := svc.Chat(context.Background(), &ChatRequest{Query: "什么是RAG"})
 		if err != nil {
 			t.Fatalf("Chat error: %v", err)
@@ -50,7 +50,7 @@ func TestChat(t *testing.T) {
 	})
 
 	t.Run("empty query", func(t *testing.T) {
-		svc := NewChatService(&mockSearcher{}, &mockEmbedder{}, &mockLLM{})
+		svc := NewChatService(&mockSearcher{}, &mockEmbedder{}, &mockLLM{}, nil)
 		_, err := svc.Chat(context.Background(), &ChatRequest{Query: ""})
 		if err == nil {
 			t.Error("expected error for empty query")
@@ -64,7 +64,7 @@ func TestChat(t *testing.T) {
 				return []SearchHit{}, nil
 			},
 		}
-		svc := NewChatService(searcher, emb, &mockLLM{})
+		svc := NewChatService(searcher, emb, &mockLLM{}, nil)
 		resp, err := svc.Chat(context.Background(), &ChatRequest{Query: "unknown"})
 		if err != nil {
 			t.Fatalf("Chat error: %v", err)
@@ -84,7 +84,7 @@ func TestChat(t *testing.T) {
 		llm := &mockLLM{generateFunc: func(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
 			return nil, errors.New("API unavailable")
 		}}
-		svc := NewChatService(searcher, emb, llm)
+		svc := NewChatService(searcher, emb, llm, nil)
 		resp, err := svc.Chat(context.Background(), &ChatRequest{Query: "test"})
 		if err != nil {
 			t.Fatalf("should not error: %v", err)

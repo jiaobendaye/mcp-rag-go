@@ -92,7 +92,7 @@ func setupIntegrationServer(t *testing.T) *gin.Engine {
 
 	chatSvc := rag.NewChatService(esIndexer, embedder, llm)
 	gin.SetMode(gin.TestMode)
-	s := New(cfg, indexChain, chatSvc, esIndexer, embedder, kbService, esIndexer)
+	s := New(cfg, nil, nil, nil, indexChain, chatSvc, esIndexer, embedder, kbService, esIndexer)
 	return s.Setup()
 }
 

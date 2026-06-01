@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -15,33 +16,51 @@ import (
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
+	"github.com/jiaobendaye/mcp-rag-go/internal/observability"
 	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
 	"github.com/jiaobendaye/mcp-rag-go/internal/security"
 )
 
 // Server holds all dependencies for HTTP handlers.
 type Server struct {
-	cfg        *config.Config
-	chain      compose.Runnable[document.Source, []string]
-	chatSvc    *rag.ChatService
-	searcher   rag.Searcher
-	embedder   rag.Embedder
-	kbs        *knowledgebase.Service
-	esIndexer  *rag.ES8Indexer
-	mcpSrv     *mcpserver.MCPServer
-	mcpHandler *mcpserver.StreamableHTTPServer
+	cfg              *config.Config
+	configManager    *config.ConfigManager
+	metricsCollector *observability.MetricsCollector
+	retrievalCache   *rag.RetrievalCache
+	chain            compose.Runnable[document.Source, []string]
+	chatSvc          *rag.ChatService
+	searcher         rag.Searcher
+	embedder         rag.Embedder
+	kbs              *knowledgebase.Service
+	esIndexer        *rag.ES8Indexer
+	mcpSrv           *mcpserver.MCPServer
+	mcpHandler       *mcpserver.StreamableHTTPServer
 }
 
 // New creates a new Server with all dependencies.
-func New(cfg *config.Config, chain compose.Runnable[document.Source, []string], chatSvc *rag.ChatService, searcher rag.Searcher, embedder rag.Embedder, kbs *knowledgebase.Service, esIndexer *rag.ES8Indexer) *Server {
+func New(
+	cfg *config.Config,
+	configManager *config.ConfigManager,
+	metricsCollector *observability.MetricsCollector,
+	retrievalCache *rag.RetrievalCache,
+	chain compose.Runnable[document.Source, []string],
+	chatSvc *rag.ChatService,
+	searcher rag.Searcher,
+	embedder rag.Embedder,
+	kbs *knowledgebase.Service,
+	esIndexer *rag.ES8Indexer,
+) *Server {
 	return &Server{
-		cfg:        cfg,
-		chain:      chain,
-		chatSvc:    chatSvc,
-		searcher:   searcher,
-		embedder:   embedder,
-		kbs:        kbs,
-		esIndexer:  esIndexer,
+		cfg:              cfg,
+		configManager:    configManager,
+		metricsCollector: metricsCollector,
+		retrievalCache:   retrievalCache,
+		chain:            chain,
+		chatSvc:          chatSvc,
+		searcher:         searcher,
+		embedder:         embedder,
+		kbs:              kbs,
+		esIndexer:        esIndexer,
 	}
 }
 
@@ -50,11 +69,25 @@ func (s *Server) Setup() *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
+	// Request tracing middleware (must be before SecurityMiddleware to set headers early)
+	r.Use(TracingMiddleware())
+
 	// Security middleware (auth + rate-limit, no-op when disabled)
 	r.Use(SecurityMiddleware(s.cfg))
 
 	// System
 	r.GET("/health", s.health)
+	r.GET("/metrics", s.metrics)
+	r.GET("/ready", s.ready)
+
+	// Config management
+	if s.configManager != nil {
+		r.GET("/config", s.configGet)
+		r.POST("/config", s.configSet)
+		r.POST("/config/bulk", s.configSetBulk)
+		r.POST("/config/reset", s.configReset)
+		r.POST("/config/reload", s.configReload)
+	}
 
 	// Document
 	r.POST("/add-document", s.addDocument)
@@ -129,9 +162,156 @@ func strPtr(s string) *string {
 	return &s
 }
 
-// health responds with service status.
+// health responds with structured service status (compatible with Python format).
 func (s *Server) health(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	if s.metricsCollector == nil {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		return
+	}
+	hd := s.metricsCollector.HealthDetail()
+	c.JSON(http.StatusOK, gin.H{
+		"status":         string(hd.Status),
+		"uptime_seconds": hd.UptimeSeconds,
+		"total_requests": hd.TotalRequests,
+		"error_count":    hd.ErrorCount,
+		"operations":     hd.Operations,
+	})
+}
+
+// metrics returns the full metrics snapshot.
+func (s *Server) metrics(c *gin.Context) {
+	if s.metricsCollector == nil {
+		c.JSON(http.StatusOK, gin.H{"error": "metrics collector not configured"})
+		return
+	}
+	snap := s.metricsCollector.Snapshot()
+	c.JSON(http.StatusOK, snap)
+}
+
+// ready checks component-level readiness.
+func (s *Server) ready(c *gin.Context) {
+	components := make(map[string]gin.H)
+
+	// Embedding model
+	if s.embedder != nil {
+		components["embedding_model"] = gin.H{
+			"status": "ready",
+			"detail": s.cfg.EmbeddingProvider + "/" + s.cfg.EmbeddingModel,
+		}
+	} else {
+		components["embedding_model"] = gin.H{"status": "not_configured", "detail": ""}
+	}
+
+	// LLM model
+	if s.cfg.LLMModel != "" {
+		components["llm_model"] = gin.H{
+			"status": "ready",
+			"detail": s.cfg.LLMProvider + "/" + s.cfg.LLMModel,
+		}
+	} else {
+		components["llm_model"] = gin.H{"status": "not_configured", "detail": ""}
+	}
+
+	// Vector store (ES)
+	if s.esIndexer != nil {
+		if err := s.esIndexer.HealthCheck(context.Background()); err == nil {
+			components["vector_store"] = gin.H{"status": "ready", "detail": "elasticsearch"}
+		} else {
+			components["vector_store"] = gin.H{"status": "error", "detail": err.Error()}
+		}
+	} else {
+		components["vector_store"] = gin.H{"status": "not_configured", "detail": ""}
+	}
+
+	// Knowledge base
+	if s.kbs != nil {
+		components["knowledge_base"] = gin.H{"status": "ready", "detail": "sqlite"}
+	} else {
+		components["knowledge_base"] = gin.H{"status": "not_configured", "detail": ""}
+	}
+
+	// Determine overall status
+	overallStatus := "ready"
+	for _, comp := range components {
+		s, _ := comp["status"].(string)
+		if s == "error" || s == "not_configured" {
+			overallStatus = "not_ready"
+			break
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":     overallStatus,
+		"components": components,
+	})
+}
+
+// configGet returns all configuration values with revision and path.
+func (s *Server) configGet(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"config":      s.configManager.GetAll(),
+		"revision":    s.configManager.Revision(),
+		"config_path": s.configManager.ConfigPath(),
+	})
+}
+
+// configSet updates a single configuration value.
+func (s *Server) configSet(c *gin.Context) {
+	var req struct {
+		Key   string      `json:"key"`
+		Value interface{} `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+		return
+	}
+	if req.Key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "key is required"})
+		return
+	}
+
+	if err := s.configManager.Set(req.Key, req.Value); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"key": req.Key, "value": req.Value, "status": "updated"})
+}
+
+// configSetBulk updates multiple configuration values at once.
+func (s *Server) configSetBulk(c *gin.Context) {
+	var bulk map[string]interface{}
+	if err := c.ShouldBindJSON(&bulk); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+		return
+	}
+
+	for key, value := range bulk {
+		if err := s.configManager.Set(key, value); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error(), "key": key})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "updated", "count": len(bulk)})
+}
+
+// configReset resets configuration to defaults.
+func (s *Server) configReset(c *gin.Context) {
+	s.configManager.Reset()
+	c.JSON(http.StatusOK, gin.H{"status": "reset"})
+}
+
+// configReload reloads configuration from disk.
+func (s *Server) configReload(c *gin.Context) {
+	if err := s.configManager.Reload(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "reloaded",
+		"revision": s.configManager.Revision(),
+	})
 }
 
 // listDocuments returns paginated documents.
@@ -169,6 +349,10 @@ func (s *Server) deleteDocument(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
+	// Invalidate cache for this collection
+	if s.retrievalCache != nil {
+		s.retrievalCache.InvalidateScope(indexName)
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "Document deleted successfully"})
 }
 
@@ -205,6 +389,10 @@ func (s *Server) deleteFile(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
+	// Invalidate cache for this collection
+	if s.retrievalCache != nil {
+		s.retrievalCache.InvalidateScope(indexName)
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "File deleted successfully"})
 }
 
@@ -222,10 +410,10 @@ func (s *Server) listKnowledgeBases(c *gin.Context) {
 // createKnowledgeBase creates a new knowledge base.
 func (s *Server) createKnowledgeBase(c *gin.Context) {
 	var req struct {
-		Name          string `json:"name"`
-		Scope         string `json:"scope"`
-		OwnerUserID   *int64 `json:"owner_user_id"`
-		OwnerAgentID  *int64 `json:"owner_agent_id"`
+		Name         string `json:"name"`
+		Scope        string `json:"scope"`
+		OwnerUserID  *int64 `json:"owner_user_id"`
+		OwnerAgentID *int64 `json:"owner_agent_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.Name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "name is required"})
@@ -263,6 +451,7 @@ func (s *Server) listCollections(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"collections": names})
 }
+
 func (s *Server) addDocument(c *gin.Context) {
 	var req struct {
 		Content string `json:"content"`
@@ -276,14 +465,14 @@ func (s *Server) addDocument(c *gin.Context) {
 		return
 	}
 
-		// Index quota check
-		iq := security.NewIndexQuotaPolicy(s.cfg.QuotaMaxIndexDocuments, s.cfg.QuotaMaxIndexChunks, s.cfg.QuotaMaxIndexChars)
-		chars := len([]rune(req.Content))
-		if d := iq.Check(1, 1+chars/s.cfg.ChunkSize, chars); !d.Allowed {
-			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": d.Reason})
-			return
-		}
-		// Write content to temp file for Chain
+	// Index quota check
+	iq := security.NewIndexQuotaPolicy(s.cfg.QuotaMaxIndexDocuments, s.cfg.QuotaMaxIndexChunks, s.cfg.QuotaMaxIndexChars)
+	chars := len([]rune(req.Content))
+	if d := iq.Check(1, 1+chars/s.cfg.ChunkSize, chars); !d.Allowed {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": d.Reason})
+		return
+	}
+	// Write content to temp file for Chain
 	if s.chain == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "index chain not configured"})
 		return
@@ -311,6 +500,11 @@ func (s *Server) addDocument(c *gin.Context) {
 	docID := ""
 	if len(ids) > 0 {
 		docID = ids[0] // Use first chunk ID as document reference
+	}
+
+	// Invalidate cache for the default index
+	if s.retrievalCache != nil {
+		s.retrievalCache.InvalidateScope(s.cfg.ESIndex)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -382,6 +576,11 @@ func (s *Server) uploadFiles(c *gin.Context) {
 		results = append(results, fileResult{Filename: fh.Filename, ContentLength: fh.Size, Processed: true})
 	}
 
+	// Invalidate cache for the default index
+	if s.retrievalCache != nil {
+		s.retrievalCache.InvalidateScope(s.cfg.ESIndex)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"total_files": len(files),
 		"successful":  successful,
@@ -403,6 +602,25 @@ func (s *Server) search(c *gin.Context) {
 		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
 			limit = parsed
 		}
+	}
+
+	// Check cache first
+	if s.retrievalCache != nil {
+		cacheKey := rag.RetrievalCacheKey{
+			Collection: s.cfg.ESIndex,
+			Query:      query,
+			Mode:       s.cfg.SearchMode,
+			Limit:      limit,
+			Threshold:  s.cfg.MinScore,
+		}
+		if cached, ok := s.retrievalCache.Get(cacheKey); ok && cached != nil {
+			c.JSON(http.StatusOK, cached)
+			return
+		}
+		defer func() {
+			// We need to set the cache after building the response
+			// This is handled below after response is constructed
+		}()
 	}
 
 	// Embed the query
@@ -431,11 +649,31 @@ func (s *Server) search(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	searchResp := gin.H{
 		"query":      query,
 		"collection": s.cfg.ESIndex,
 		"results":    results,
-	})
+	}
+
+	// Store in cache
+	if s.retrievalCache != nil {
+		cacheKey := rag.RetrievalCacheKey{
+			Collection: s.cfg.ESIndex,
+			Query:      query,
+			Mode:       s.cfg.SearchMode,
+			Limit:      limit,
+			Threshold:  s.cfg.MinScore,
+		}
+		searchHits := make([]rag.SearchHit, len(hits))
+		copy(searchHits, hits)
+		s.retrievalCache.Set(cacheKey, &rag.SearchResponse{
+			Query:      query,
+			Collection: s.cfg.ESIndex,
+			Results:    searchHits,
+		})
+	}
+
+	c.JSON(http.StatusOK, searchResp)
 }
 
 // chat handles RAG-based conversation.

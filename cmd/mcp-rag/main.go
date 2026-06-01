@@ -19,6 +19,7 @@ import (
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
+	"github.com/jiaobendaye/mcp-rag-go/internal/observability"
 	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
 	"github.com/jiaobendaye/mcp-rag-go/internal/server"
 )
@@ -51,11 +52,19 @@ func main() {
 func runServe(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	cfg, err := config.Load(configPath)
+	// ConfigManager for hot-reload and CRUD API
+	configManager, err := config.NewConfigManager(configPath)
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return fmt.Errorf("create config manager: %w", err)
 	}
+	cfg := configManager.Get()
 	log.Printf("Starting MCP-RAG server on port %d", cfg.HTTPPort)
+
+	// Observability
+	metricsCollector := observability.NewMetricsCollector(observability.DefaultMetricsConfig())
+
+	// Retrieval cache
+	retrievalCache := rag.NewRetrievalCache()
 
 	// Connect to ES
 	esClient, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{cfg.ESUrl}})
@@ -119,12 +128,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("build index chain: %w", err)
 	}
 
+	// Build retrieval graph
+	graph, err := rag.BuildRetrievalGraph(ctx, embedder, esIndexer, llm, cfg.SearchMode)
+	if err != nil {
+		return fmt.Errorf("build retrieval graph: %w", err)
+	}
+
 	// Services
-	chatSvc := rag.NewChatService(esIndexer, embedder, llm)
+	chatSvc := rag.NewChatService(esIndexer, embedder, llm, graph)
 
 	// Setup HTTP
 	gin.SetMode(gin.ReleaseMode)
-	srv := server.New(cfg, chain, chatSvc, esIndexer, embedder, kbService, esIndexer)
+	srv := server.New(cfg, configManager, metricsCollector, retrievalCache, chain, chatSvc, esIndexer, embedder, kbService, esIndexer)
 	router := srv.Setup()
 
 	httpServer := &http.Server{Addr: fmt.Sprintf(":%d", cfg.HTTPPort), Handler: router}

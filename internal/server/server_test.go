@@ -72,8 +72,8 @@ func setupTestServer() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	cfg := config.DefaultConfig()
 	emb := &httpTestEmbedder{}
-	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{})
-	s := New(cfg, nil, chatSvc, &testMockSearcher{}, emb, nil, nil)
+	chatSvc := rag.NewChatService(&testMockSearcher{}, emb, &mockLLM{}, nil)
+	s := New(cfg, nil, nil, nil, nil, chatSvc, &testMockSearcher{}, emb, nil, nil)
 	return s.Setup()
 }
 

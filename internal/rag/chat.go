@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -40,11 +41,13 @@ type ChatService struct {
 	searcher Searcher
 	embedder Embedder
 	llm      LLMGenerator
+	graph    compose.Runnable[string, string] // optional: Eino Graph mode
 }
 
 // NewChatService creates a new ChatService.
-func NewChatService(searcher Searcher, embedder Embedder, llm LLMGenerator) *ChatService {
-	return &ChatService{searcher: searcher, embedder: embedder, llm: llm}
+// graph is optional; if nil, the service falls back to raw mode.
+func NewChatService(searcher Searcher, embedder Embedder, llm LLMGenerator, graph compose.Runnable[string, string]) *ChatService {
+	return &ChatService{searcher: searcher, embedder: embedder, llm: llm, graph: graph}
 }
 
 // Chat performs RAG-based conversation: retrieve → build prompt → generate.
@@ -52,6 +55,33 @@ func (c *ChatService) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse
 	if strings.TrimSpace(req.Query) == "" {
 		return nil, fmt.Errorf("query is required")
 	}
+
+	// Use graph mode if available
+	if c.graph != nil {
+		return c.chatViaGraph(ctx, req)
+	}
+
+	// Fallback: raw mode (original hand-written logic)
+	return c.chatViaRaw(ctx, req)
+}
+
+// chatViaGraph uses the Eino Graph for retrieval + generation.
+func (c *ChatService) chatViaGraph(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
+	answer, err := c.graph.Invoke(ctx, req.Query)
+	if err != nil {
+		return nil, fmt.Errorf("graph invoke: %w", err)
+	}
+
+	return &ChatResponse{
+		Query:      req.Query,
+		Collection: "kb_1",
+		Response:   answer,
+		Sources:    nil,
+	}, nil
+}
+
+// chatViaRaw uses the original hand-written retrieval pipeline.
+func (c *ChatService) chatViaRaw(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 
 	vecs, err := c.embedder.EmbedStrings(ctx, []string{req.Query})
 	if err != nil {

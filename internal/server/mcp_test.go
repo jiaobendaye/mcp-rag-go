@@ -86,9 +86,9 @@ func setupMCPServer(t *testing.T) *gin.Engine {
 	cfg := config.DefaultConfig()
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
-	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{})
+	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{}, nil)
 
-	s := New(cfg, nil, chatSvc, searcher, emb, kbs, nil)
+	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil)
 	return s.Setup()
 }
 
@@ -109,8 +109,8 @@ func TestMCPRagAskParameterParsing(t *testing.T) {
 	cfg := config.DefaultConfig()
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
-	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{})
-	s := New(cfg, nil, chatSvc, searcher, emb, kbs, nil)
+	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{}, nil)
+	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil)
 
 	// Init MCP server (stores mcpSrv on the Server)
 	s.mcpSrv, s.mcpHandler = s.InitMCP()
@@ -264,8 +264,8 @@ func TestMCPToolsRegistered(t *testing.T) {
 	cfg := config.DefaultConfig()
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
-	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{})
-	s := New(cfg, nil, chatSvc, searcher, emb, kbs, nil)
+	chatSvc := rag.NewChatService(searcher, emb, &mcpTestLLM{}, nil)
+	s := New(cfg, nil, nil, nil, nil, chatSvc, searcher, emb, kbs, nil)
 	s.mcpSrv, s.mcpHandler = s.InitMCP()
 
 	tools := s.mcpSrv.ListTools()
