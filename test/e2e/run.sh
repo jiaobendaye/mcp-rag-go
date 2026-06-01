@@ -71,7 +71,6 @@ do_setup() {
   cat > "$RUN_DIR/config.yaml" << EOF
 http_port: $SERVER_PORT
 es_url: "$ES_URL"
-es_index: "$ES_INDEX"
 knowledge_base_db_path: "$RUN_DIR/e2e_kb.db"
 static_dir: "$RUN_DIR/static"
 

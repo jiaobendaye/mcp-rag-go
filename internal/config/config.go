@@ -18,7 +18,6 @@ type Config struct {
 
 	// Elasticsearch
 	ESUrl    string `yaml:"es_url"`    // ES connection URL
-	ESIndex  string `yaml:"es_index"`  // ES index name (legacy, for single KB)
 
 	// Knowledge Base
 	KnowledgeBaseDBPath string `yaml:"knowledge_base_db_path"`
@@ -68,7 +67,6 @@ func DefaultConfig() *Config {
 		HTTPPort:          8060,
 		StaticDir:         "./static",
 		ESUrl:             "http://localhost:9200",
-		ESIndex:           "kb_1",
 		KnowledgeBaseDBPath: "./data/knowledge_bases.sqlite3",
 		EmbeddingProvider: "openai",
 		EmbeddingModel:    "text-embedding-3-small",
@@ -119,7 +117,6 @@ func applyEnvOverrides(cfg *Config) {
 	envMap := map[string]func(string){
 		"MCP_RAG_HTTP_PORT":            func(v string) { cfg.HTTPPort = parseInt(v, cfg.HTTPPort) },
 		"MCP_RAG_ES_URL":               func(v string) { cfg.ESUrl = v },
-		"MCP_RAG_ES_INDEX":             func(v string) { cfg.ESIndex = v },
 		"MCP_RAG_EMBEDDING_PROVIDER":   func(v string) { cfg.EmbeddingProvider = v },
 		"MCP_RAG_EMBEDDING_MODEL":      func(v string) { cfg.EmbeddingModel = v },
 		"MCP_RAG_EMBEDDING_BASE_URL":   func(v string) { cfg.EmbeddingBaseURL = v },

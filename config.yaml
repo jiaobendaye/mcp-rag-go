@@ -6,7 +6,6 @@ http_port: 8060
 
 # Elasticsearch
 es_url: "http://localhost:9200"
-es_index: "kb_1"
 
 # Embedding Provider (local Ollama)
 embedding_provider: "ollama"

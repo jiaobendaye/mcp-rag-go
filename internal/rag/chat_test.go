@@ -95,6 +95,31 @@ func TestChat(t *testing.T) {
 	})
 }
 
+func TestChat_DefaultCollectionIsNotKB1(t *testing.T) {
+	// Regression: chat.go used to default the collection to "kb_1" when
+	// the request didn't specify one. After the cleanup, the default is
+	// "default" (a logical name, not a hardcoded ES index).
+	emb := &mockEmbedder{}
+	searcher := &mockSearcher{
+		searchHybridFunc: func(ctx context.Context, query string, queryVector []float32, topK int, minScore float64) ([]SearchHit, error) {
+			return []SearchHit{{ChunkID: "c1", Content: "anything", Score: 0.9}}, nil
+		},
+	}
+	llm := &mockLLM{}
+	svc := NewChatService(searcher, emb, llm, nil)
+
+	resp, err := svc.Chat(context.Background(), &ChatRequest{Query: "no-collection-set"})
+	if err != nil {
+		t.Fatalf("Chat error: %v", err)
+	}
+	if resp.Collection == "kb_1" {
+		t.Errorf("default collection should no longer be the hardcoded 'kb_1', got %q", resp.Collection)
+	}
+	if resp.Collection != "default" {
+		t.Errorf("expected default collection='default', got %q", resp.Collection)
+	}
+}
+
 func TestBuildChatPrompt(t *testing.T) {
 	hits := []SearchHit{
 		{Content: "RAG是一种技术", Score: 0.95},

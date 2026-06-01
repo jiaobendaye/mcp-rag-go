@@ -48,6 +48,11 @@ func (e *ES8Indexer) EnsureIndex(ctx context.Context, dims int) error {
 	return e.ensureIndex(ctx, e.indexName, dims)
 }
 
+// IndexName returns the ES index name this indexer writes to.
+func (e *ES8Indexer) IndexName() string {
+	return e.indexName
+}
+
 // EnsureIndexForKB creates an ES index with the given name if it doesn't exist.
 func (e *ES8Indexer) EnsureIndexForKB(ctx context.Context, indexName string, dims int) error {
 	return e.ensureIndex(ctx, indexName, dims)

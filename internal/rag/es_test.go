@@ -110,6 +110,16 @@ func TestGenerateDocID(t *testing.T) {
 	}
 }
 
+func TestES8Indexer_IndexName(t *testing.T) {
+	// We don't need a real ES client to verify IndexName() round-trips.
+	// The constructor stores the name; the getter returns it.
+	const name = "kb_test_42"
+	idx := &ES8Indexer{indexName: name}
+	if got := idx.IndexName(); got != name {
+		t.Errorf("IndexName() = %q, want %q", got, name)
+	}
+}
+
 func TestMockIndexerEnsureIndex(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		m := &mockIndexer{

@@ -143,6 +143,10 @@ func (s *Server) Setup() *gin.Engine {
 
 // resolveKB resolves kb_id or legacy collection to a concrete ES index.
 func (s *Server) resolveKB(c *gin.Context) (*knowledgebase.Resolution, string, error) {
+	if s.kbs == nil {
+		return nil, "", fmt.Errorf("knowledge base service not configured")
+	}
+
 	kbID := parseIntPtr(c.Query("kb_id"))
 	scope := strPtr(c.Query("scope"))
 	collection := c.Query("collection")
@@ -151,11 +155,6 @@ func (s *Server) resolveKB(c *gin.Context) (*knowledgebase.Resolution, string, e
 	}
 	userID := parseIntPtr(c.Query("user_id"))
 	agentID := parseIntPtr(c.Query("agent_id"))
-
-	// Fallback to legacy ES index when KB service is not available
-	if s.kbs == nil {
-		return nil, s.cfg.ESIndex, nil
-	}
 
 	legacyKey := ""
 	if kbID == nil && scope == nil {
@@ -446,7 +445,6 @@ func (s *Server) buildConfigGetResponse() gin.H {
 		"debug":                 false,
 		"vector_db_type":        "elasticsearch",
 		"es_url":                s.cfg.ESUrl,
-		"es_index":              s.cfg.ESIndex,
 		"knowledge_base_db_path": s.cfg.KnowledgeBaseDBPath,
 		"embedding_provider":     s.cfg.EmbeddingProvider,
 		"embedding_model":        s.cfg.EmbeddingModel,
@@ -845,9 +843,9 @@ func (s *Server) addDocument(c *gin.Context) {
 		docID = ids[0] // Use first chunk ID as document reference
 	}
 
-	// Invalidate cache for the default index
-	if s.retrievalCache != nil {
-		s.retrievalCache.InvalidateScope(s.cfg.ESIndex)
+	// Invalidate cache for the index the chain actually wrote to
+	if s.retrievalCache != nil && s.esIndexer != nil {
+		s.retrievalCache.InvalidateScope(s.esIndexer.IndexName())
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -919,9 +917,9 @@ func (s *Server) uploadFiles(c *gin.Context) {
 		results = append(results, fileResult{Filename: fh.Filename, ContentLength: fh.Size, Processed: true})
 	}
 
-	// Invalidate cache for the default index
-	if s.retrievalCache != nil {
-		s.retrievalCache.InvalidateScope(s.cfg.ESIndex)
+	// Invalidate cache for the index the chain actually wrote to
+	if s.retrievalCache != nil && s.esIndexer != nil {
+		s.retrievalCache.InvalidateScope(s.esIndexer.IndexName())
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1331,7 +1329,7 @@ func (s *Server) chatMultiKB(c *gin.Context, req *rag.ChatRequest) {
 // resolveKBFromChat resolves KB from ChatRequest fields.
 func (s *Server) resolveKBFromChat(req *rag.ChatRequest) (*knowledgebase.Resolution, string, error) {
 	if s.kbs == nil {
-		return nil, s.cfg.ESIndex, nil
+		return nil, "", fmt.Errorf("knowledge base service not configured")
 	}
 
 	scope := req.Scope

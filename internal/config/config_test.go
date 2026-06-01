@@ -22,9 +22,6 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.MinScore != 0.7 {
 		t.Errorf("expected MinScore=0.7, got %f", cfg.MinScore)
 	}
-	if cfg.ESIndex != "kb_1" {
-		t.Errorf("expected ESIndex=kb_1, got %s", cfg.ESIndex)
-	}
 }
 
 func TestLoadFromYAML(t *testing.T) {
@@ -169,5 +166,53 @@ func TestEnvVarFallback(t *testing.T) {
 	}
 	if cfg2.EmbeddingAPIKey != "sk-test-key" {
 		t.Errorf("expected EmbeddingAPIKey=sk-test-key (fallback), got %s", cfg2.EmbeddingAPIKey)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Legacy ESIndex removal regression tests
+// ---------------------------------------------------------------------------
+
+func TestLoad_LegacyESIndexKeyIsIgnored(t *testing.T) {
+	// Old config.yaml files in the wild may still contain `es_index: ...`.
+	// Loading such a file must NOT error (unknown keys are silently dropped
+	// by yaml.Unmarshal) and must NOT populate any field by that name.
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+
+	content := `
+http_port: 9090
+es_url: "http://es:9200"
+es_index: "should_be_ignored_kb_42"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load should not error on legacy es_index key, got: %v", err)
+	}
+	if cfg.HTTPPort != 9090 {
+		t.Errorf("expected HTTPPort=9090, got %d", cfg.HTTPPort)
+	}
+	if cfg.ESUrl != "http://es:9200" {
+		t.Errorf("expected ESUrl=http://es:9200, got %s", cfg.ESUrl)
+	}
+}
+
+func TestEnvVarOverride_LegacyESIndexIsIgnored(t *testing.T) {
+	// The MCP_RAG_ES_INDEX env var used to populate cfg.ESIndex. After the
+	// cleanup, the env var should be silently ignored (no panic, no error,
+	// other env vars still work).
+	t.Setenv("MCP_RAG_ES_INDEX", "should_be_ignored_kb_42")
+	t.Setenv("MCP_RAG_HTTP_PORT", "9090")
+
+	cfg, err := Load("/nonexistent/path")
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if cfg.HTTPPort != 9090 {
+		t.Errorf("expected HTTPPort=9090, got %d", cfg.HTTPPort)
 	}
 }

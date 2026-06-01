@@ -88,7 +88,7 @@ func (c *ChatService) chatViaGraph(ctx context.Context, req *ChatRequest) (*Chat
 
 	collection := req.Collection
 	if collection == "" {
-		collection = "kb_1"
+		collection = "default"
 	}
 
 	return &ChatResponse{
@@ -119,7 +119,7 @@ func (c *ChatService) chatViaRaw(ctx context.Context, req *ChatRequest) (*ChatRe
 
 	collection := req.Collection
 	if collection == "" {
-		collection = "kb_1"
+		collection = "default"
 	}
 
 	if len(hits) == 0 {
