@@ -66,9 +66,8 @@ func setupSecureServer(securityCfg *config.Config) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 
 	emb := &httpTestEmbedder{}
-	searcher := &testMockSearcher{}
 
-	s, _ := New(securityCfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, searcher, nil, nil, 0)
+	s, _ := New(securityCfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, nil, nil, 0)
 	return s.Setup()
 }
 

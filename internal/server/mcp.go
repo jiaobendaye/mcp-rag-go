@@ -171,7 +171,7 @@ func (s *Server) resolveMCPKB(kbID int, scope string, userID, agentID int, colle
 
 // handleRawMode performs search-only and returns formatted text.
 func (s *Server) handleRawMode(ctx context.Context, query string, limit int, threshold float64, indexName string) (*mcp.CallToolResult, error) {
-	docs, err := s.retrieveAt(ctx, s.kbRetriever, indexName, query, limit, threshold, s.cfg.SearchMode)
+	docs, err := s.retrieveAt(ctx, indexName, query, limit, threshold, s.cfg.SearchMode)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("检索失败: %v", err)), nil
 	}
@@ -208,16 +208,14 @@ func (s *Server) handleRawMode(ctx context.Context, query string, limit int, thr
 	return mcp.NewToolResultText(sb.String()), nil
 }
 
-// handleSummaryMode uses the pre-compiled retrieval graph to
-// retrieve + LLM summary. KB params are injected via context.
+// handleSummaryMode compiles the retrieval graph per-request and runs
+// retrieve + LLM summarization.
 func (s *Server) handleSummaryMode(ctx context.Context, query string, limit int, threshold float64, indexName string) (*mcp.CallToolResult, error) {
-	ctx = rag.WithKBParams(ctx, rag.KBParams{
-		IndexNames: []string{indexName},
-		TopK:       limit,
-		MinScore:   threshold,
-		SearchMode: s.cfg.SearchMode,
-	})
-	answer, err := s.preCompiledGraph.Invoke(ctx, query)
+	chain, err := rag.BuildRetrievalGraph(ctx, s.esClient, s.llm, s.embedder, []string{indexName}, limit, threshold, s.cfg.SearchMode)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
+	}
+	answer, err := chain.Invoke(ctx, query)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
 	}
@@ -366,13 +364,11 @@ func (s *Server) handleRagAskMultiKB(ctx context.Context, query string, mode str
 		for i, kb := range kbs {
 			indexNames[i] = kb.indexName
 		}
-		kbCtx := rag.WithKBParams(ctx, rag.KBParams{
-			IndexNames: indexNames,
-			TopK:       limit,
-			MinScore:   threshold,
-			SearchMode: s.cfg.SearchMode,
-		})
-		answer, err := s.preCompiledGraph.Invoke(kbCtx, query)
+		chain, err := rag.BuildRetrievalGraph(ctx, s.esClient, s.llm, s.embedder, indexNames, limit, threshold, s.cfg.SearchMode)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
+		}
+		answer, err := chain.Invoke(ctx, query)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
 		}
@@ -396,7 +392,7 @@ func (s *Server) handleRagAskMultiKB(ctx context.Context, query string, mode str
 		wg.Add(1)
 		go func(idx int, info kbInfo) {
 			defer wg.Done()
-			docs, err := s.retrieveAt(ctx, s.kbRetriever, info.indexName, query, limit, threshold, s.cfg.SearchMode)
+			docs, err := s.retrieveAt(ctx, info.indexName, query, limit, threshold, s.cfg.SearchMode)
 			results[idx] = result{kbName: info.kb.Name, docs: docs, err: err}
 		}(i, kb)
 	}

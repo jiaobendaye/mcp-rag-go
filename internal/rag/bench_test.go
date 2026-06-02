@@ -7,7 +7,8 @@ import (
 	"github.com/cloudwego/eino/components/embedding"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
-	elastic_retriever "github.com/cloudwego/eino-ext/components/retriever/es8"
+
+	elasticsearch "github.com/elastic/go-elasticsearch/v8"
 )
 
 func BenchmarkBuildIndexChain(b *testing.B) {
@@ -20,13 +21,11 @@ func BenchmarkBuildRetrievalGraph(b *testing.B) {
 	ctx := context.Background()
 	llm := &benchLLM{}
 	emb := &benchEmbedder{}
-	k := &KBRetriever{
-		base: nil,
-		conf: &elastic_retriever.RetrieverConfig{Index: PlaceholderIndex},
-	}
+	esClient := &elasticsearch.Client{}
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := BuildRetrievalGraph(ctx, k, llm, emb)
+		_, err := BuildRetrievalGraph(ctx, esClient, llm, emb, []string{"kb_2"}, 7, 0.6, "hybrid")
 		if err != nil {
 			b.Fatal(err)
 		}

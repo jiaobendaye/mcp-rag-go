@@ -40,10 +40,10 @@ func TestBuildIndexChain_ConfigNotMutated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create splitter: %v", err)
 	}
-	conf := &elastic_indexer.IndexerConfig{Index: PlaceholderIndex}
+	conf := &elastic_indexer.IndexerConfig{Index: "test_placeholder"}
 	_, err = BuildIndexChain(context.Background(), splitter, conf, "kb_test")
 	// Without a real ES client, NewIndexer will fail — that's expected.
-	if conf.Index != PlaceholderIndex {
+	if conf.Index != "test_placeholder" {
 		t.Errorf("config.Index was mutated: %q", conf.Index)
 	}
 	_ = err

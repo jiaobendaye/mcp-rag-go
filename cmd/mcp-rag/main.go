@@ -17,8 +17,6 @@ import (
 	"github.com/cloudwego/eino/components/document"
 
 	elastic_indexer "github.com/cloudwego/eino-ext/components/indexer/es8"
-	elastic_retriever "github.com/cloudwego/eino-ext/components/retriever/es8"
-	elastic_search_mode "github.com/cloudwego/eino-ext/components/retriever/es8/search_mode"
 	openaiembed "github.com/cloudwego/eino-ext/components/embedding/openai"
 	openaimodel "github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino-ext/components/document/transformer/splitter/recursive"
@@ -153,21 +151,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 		Embedding:        embedder,
 	}
 
-	// KB retriever (template; per-call index routing via WithIndex)
-	minScore := cfg.MinScore
-	kbRetriever, err := rag.NewKBRetriever(ctx, &elastic_retriever.RetrieverConfig{
-		Client:         esClient,
-		Index:          rag.PlaceholderIndex,
-		TopK:           cfg.TopK,
-		ScoreThreshold: &minScore,
-		SearchMode:     elastic_search_mode.SearchModeRawStringRequest(),
-		ResultParser:   rag.ProjectResultParser(),
-		Embedding:      embedder,
-	})
-	if err != nil {
-		return fmt.Errorf("create kb retriever: %w", err)
-	}
-
 	// eino-ext LLM
 	llm, err := openaimodel.NewChatModel(ctx, &openaimodel.ChatModelConfig{
 		BaseURL: cfg.LLMBaseURL,
@@ -181,7 +164,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Setup HTTP
 	gin.SetMode(gin.ReleaseMode)
 	srv, err := server.New(cfg, configManager, metricsCollector, retrievalCache,
-		embedder, splitter, llm, indexerConf, kbRetriever, esClient, kbService, dims)
+		embedder, splitter, llm, indexerConf, esClient, kbService, dims)
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
 	}

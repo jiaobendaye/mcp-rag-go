@@ -59,13 +59,35 @@ func (cm *ConfigManager) OnConfigChange(cb ConfigChangeCallback) { ... }
 
 ```sql
 ALTER TABLE knowledge_bases ADD COLUMN embedding_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE knowledge_bases ADD COLUMN embedding_dims  INTEGER NOT NULL DEFAULT 0;
 ```
 
-- 创建 KB 时记录当前 model 名（如 `mxbai-embed-large`）
-- 切换前：resolve 时校验 model 匹配，不匹配的 KB 在迁移前仍用旧 embedder 服务
-- 切换后：旧 embedder 丢弃，所有 KB 指向新 model
+- `embedding_model`：语义标识（如 `"mxbai-embed-large"`），同维度不同模型向量空间不兼容
+- `embedding_dims`：快速数值校验，维度不同一定不兼容；来自 probe `len(vecs[0])`
 
-SwappableEmbedder 在迁移窗口期只持有一个 embedder（正在用的）。迁移过程中旧 embedder 继续为未迁移的 KB 服务。
+**Service 新增方法**：
+
+```go
+// 启动时注入，热切换后更新
+func (s *Service) SetEmbeddingInfo(model string, dims int)
+
+// 校验 KB 的模型/维度是否与当前 embedder 匹配
+// 空值（"" / 0）视为未初始化，跳过校验
+func (s *Service) CheckEmbeddingMatch(kb *KnowledgeBase) error
+```
+
+**创建 KB 时**：`Store.Create` 接收 `embeddingModel` 和 `embeddingDims` 参数（Service/Store 内部调用，外部通过 `SetEmbeddingInfo` 注入，Create 自动带出）。
+
+**校验点**（resolve 后、embedder 使用前）：
+
+| 操作 | 校验 | 理由 |
+|------|------|------|
+| `addDocument` | ✓ | 索引写入向量，必须匹配 |
+| `search` / `chat` | ✓ | 检索用当前 embedder 编码 query，必须与索引一致 |
+| `deleteDocument` | ✗ | 不需要 embedding |
+| `Resolve`（自动创建） | ✗ | 新建 KB 自动记录当前模型，无需校验 |
+
+切换前 resolve 时 `CheckEmbeddingMatch` 失败 → 说明该 KB 用的是旧模型，在迁移完成前仍用旧 embedder 服务。切换后旧 embedder 丢弃，所有 KB 指向新模型。
 
 ### 5. KB 迁移状态机
 
@@ -143,13 +165,12 @@ active → migrating → migrated → active（切换后）
 |------|------|
 | `internal/embedder/swappable.go` | 新增 SwappableEmbedder |
 | `internal/config/manager.go` | 加 OnConfigChange callback |
-| `internal/knowledgebase/models.go` | KB 加 EmbeddingModel 字段；status 加 migrating/migrated |
-| `internal/knowledgebase/store.go` | 支持 status 更新、collection_name 更新 |
-| `internal/knowledgebase/service.go` | 新增迁移相关方法 |
-| `internal/server/server.go` | embedder 改 SwappableEmbedder，去 preCompiledGraph，每请求编译 graph，加 /admin/embedding/* 端点 |
+| `internal/knowledgebase/models.go` | KB 加 `EmbeddingModel`、`EmbeddingDims` 字段；status 加 migrating/migrated |
+| `internal/knowledgebase/store.go` | Create 加 embeddingModel/embeddingDims 参数；scanKB/scanKBs 读新列；支持 status 更新、collection_name 更新 |
+| `internal/knowledgebase/service.go` | 新增 `SetEmbeddingInfo`、`CheckEmbeddingMatch`、迁移相关方法 |
+| `internal/server/server.go` | embedder 改 SwappableEmbedder，去 preCompiledGraph，每请求编译 graph；addDocument/retrieveAt 调用 CheckEmbeddingMatch；加 /admin/embedding/* 端点 |
 | `internal/server/mcp.go` | handleSummaryMode 改为每请求编译 graph |
-| `internal/rag/chat.go` | ChatRequest 不变（embedding 切换对业务透明） |
-| `cmd/mcp-rag/main.go` | 创建 SwappableEmbedder，注册 callback |
+| `cmd/mcp-rag/main.go` | 创建 SwappableEmbedder，注册 callback；启动时 `kbService.SetEmbeddingInfo()` |
 
 ## 验证
 

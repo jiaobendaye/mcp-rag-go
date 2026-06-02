@@ -20,8 +20,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	elastic_indexer "github.com/cloudwego/eino-ext/components/indexer/es8"
-	elastic_retriever "github.com/cloudwego/eino-ext/components/retriever/es8"
-	elastic_search_mode "github.com/cloudwego/eino-ext/components/retriever/es8/search_mode"
 	openaiembed "github.com/cloudwego/eino-ext/components/embedding/openai"
 	openaimodel "github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/components/document"
@@ -152,18 +150,6 @@ func setupIntegrationServer(t *testing.T) (*gin.Engine, *knowledgebase.Service, 
 		}
 	}
 
-	// KB retriever
-	kbRetriever, err := rag.NewKBRetriever(ctx, &elastic_retriever.RetrieverConfig{
-		Client:         esClient,
-		Index:          rag.PlaceholderIndex,
-		TopK:           5,
-		SearchMode:     elastic_search_mode.SearchModeRawStringRequest(),
-		ResultParser:   rag.ProjectResultParser(),
-		Embedding:      embedder,
-	})
-	if err != nil {
-		t.Fatalf("create kb retriever: %v", err)
-	}
 
 	// LLM (best-effort)
 	llm, err := openaimodel.NewChatModel(ctx, &openaimodel.ChatModelConfig{
@@ -177,7 +163,7 @@ func setupIntegrationServer(t *testing.T) (*gin.Engine, *knowledgebase.Service, 
 	}
 
 	gin.SetMode(gin.TestMode)
-	s, err := New(cfg, nil, nil, nil, embedder, splitter, llm, indexerConf, kbRetriever, esClient, kbService, dims)
+	s, err := New(cfg, nil, nil, nil, embedder, splitter, llm, indexerConf, esClient, kbService, dims)
 	if err != nil {
 		t.Fatalf("create server: %v", err)
 	}
@@ -608,6 +594,82 @@ func mcpCall(t *testing.T, r http.Handler, sessionID string, id int, tool, argsJ
 
 // TestMCP_RawMode_SingleKB verifies that MCP rag_ask in raw mode returns
 // relevant retrieved documents from a single KB.
+
+// TestChat_MultiKB verifies that POST /chat with kb_ids fans out to
+// multiple KBs via the Parallel graph path and returns a coherent answer.
+func TestChat_MultiKB(t *testing.T) {
+	r, kbSvc, esClient := setupIntegrationServer(t)
+
+	// Seed KB 1 with Rust content
+	kb1, err := kbSvc.Create("chat_multi_rust", "public", nil, nil)
+	if err != nil {
+		t.Fatalf("create kb1: %v", err)
+	}
+	add1 := fmt.Sprintf(`{"content":"Rust语言具有零成本抽象和所有权系统。","kb_id":%d}`, kb1.ID)
+	w1 := httptest.NewRecorder()
+	req1, _ := http.NewRequest("POST", "/add-document", strings.NewReader(add1))
+	req1.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w1, req1)
+	if w1.Code != 200 {
+		t.Fatalf("add-document kb1: %d %s", w1.Code, w1.Body.String())
+	}
+
+	// Seed KB 2 with Python content
+	kb2, err := kbSvc.Create("chat_multi_python", "public", nil, nil)
+	if err != nil {
+		t.Fatalf("create kb2: %v", err)
+	}
+	add2 := fmt.Sprintf(`{"content":"Python是一种解释型语言，具有简洁的语法和丰富的标准库。","kb_id":%d}`, kb2.ID)
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("POST", "/add-document", strings.NewReader(add2))
+	req2.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w2, req2)
+	if w2.Code != 200 {
+		t.Fatalf("add-document kb2: %d %s", w2.Code, w2.Body.String())
+	}
+
+	// ES refresh so both docs are searchable
+	if refreshResp, err := esClient.Indices.Refresh(esClient.Indices.Refresh.WithIndex("kb_*")); err != nil {
+		t.Logf("refresh warning: %v", err)
+	} else {
+		refreshResp.Body.Close()
+	}
+
+	// Chat across both KBs
+	chatBody := fmt.Sprintf(`{"query":"Rust和Python的区别","kb_ids":[%d,%d],"limit":2,"threshold":0.2}`, kb1.ID, kb2.ID)
+	w3 := httptest.NewRecorder()
+	req3, _ := http.NewRequest("POST", "/chat", strings.NewReader(chatBody))
+	req3.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w3, req3)
+	t.Logf("chat multi-kb response code=%d body=%s", w3.Code, w3.Body.String())
+
+	if w3.Code != 200 {
+		if strings.Contains(w3.Body.String(), "Unauthorized") ||
+			strings.Contains(w3.Body.String(), "chat_model") {
+			t.Skipf("LLM unavailable, skipping multi-kb chat test: %s", w3.Body.String())
+		}
+		t.Fatalf("multi-kb chat failed: %d %s", w3.Code, w3.Body.String())
+	}
+
+	var resp struct {
+		Response string `json:"response"`
+		Query    string `json:"query"`
+	}
+	if err := json.Unmarshal(w3.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse chat response: %v", err)
+	}
+	if resp.Response == "" {
+		t.Error("chat response should be non-empty")
+	}
+	// The LLM should mention both topics from the two KBs
+	if !strings.Contains(resp.Response, "Rust") {
+		t.Errorf("chat response should mention Rust, got: %s", resp.Response)
+	}
+	if !strings.Contains(resp.Response, "Python") {
+		t.Errorf("chat response should mention Python, got: %s", resp.Response)
+	}
+}
+
 func TestMCP_RawMode_SingleKB(t *testing.T) {
 	r, kbSvc, _ := setupIntegrationServer(t)
 

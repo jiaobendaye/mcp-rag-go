@@ -13,13 +13,13 @@ import (
 	"sync"
 
 	"github.com/cloudwego/eino/components/document"
-	"github.com/cloudwego/eino/components/retriever"
-	"github.com/cloudwego/eino/compose"
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/gin-gonic/gin"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
 	elastic_indexer "github.com/cloudwego/eino-ext/components/indexer/es8"
+	elastic_retriever "github.com/cloudwego/eino-ext/components/retriever/es8"
+	elastic_search_mode "github.com/cloudwego/eino-ext/components/retriever/es8/search_mode"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
@@ -40,13 +40,8 @@ type Server struct {
 	embedder    rag.Embedder
 	llm         rag.LLMGenerator
 	indexerConf *elastic_indexer.IndexerConfig
-	kbRetriever retriever.Retriever
 
-	// Pre-compiled graph (compiled once at startup, reused across all
-	// requests with KB params injected via context).
-	preCompiledGraph compose.Runnable[string, string]
-
-	// Direct ES client for admin endpoints
+	// Direct ES client for admin endpoints and per-request retriever creation
 	esClient *elasticsearch.Client
 
 	// Knowledge base service
@@ -59,10 +54,7 @@ type Server struct {
 	mcpHandler *mcpserver.StreamableHTTPServer
 }
 
-// New creates a new Server with all dependencies and pre-compiles the
-// retrieval graph and index chain when all required components are
-// available. Returns an error only if compilation of available components
-// fails (nil components skip compilation gracefully — useful for tests).
+// New creates a new Server with all dependencies.
 func New(
 	cfg *config.Config,
 	configManager *config.ConfigManager,
@@ -72,23 +64,10 @@ func New(
 	splitter document.Transformer,
 	llm rag.LLMGenerator,
 	indexerConf *elastic_indexer.IndexerConfig,
-	kbRetriever retriever.Retriever,
 	esClient *elasticsearch.Client,
 	kbs *knowledgebase.Service,
 	embedDims int,
 ) (*Server, error) {
-	// Pre-compile the retrieval graph when all required components are
-	// available (nil components skip compilation — tests may pass nil).
-	var preCompiledGraph compose.Runnable[string, string]
-
-	if kbRetriever != nil && llm != nil && embedder != nil {
-		var err error
-		preCompiledGraph, err = rag.BuildRetrievalGraph(context.Background(), kbRetriever, llm, embedder)
-		if err != nil {
-			return nil, fmt.Errorf("pre-compile retrieval graph: %w", err)
-		}
-	}
-
 	return &Server{
 		cfg:              cfg,
 		configManager:    configManager,
@@ -97,13 +76,11 @@ func New(
 		embedder:         embedder,
 		splitter:         splitter,
 		llm:              llm,
-		indexerConf: indexerConf,
-		kbRetriever:      kbRetriever,
+		indexerConf:      indexerConf,
 		esClient:         esClient,
 		kbs:              kbs,
 		embedDims:        embedDims,
 		classifier:       rag.NewQueryClassifier(),
-		preCompiledGraph:  preCompiledGraph,
 	}, nil
 }
 
@@ -335,7 +312,7 @@ func (s *Server) buildRuntimeSnapshot() gin.H {
 	}
 
 	// hybrid_service
-	if s.kbRetriever != nil {
+	if s.esClient != nil {
 		runtime["hybrid_service"] = "ready"
 	} else {
 		runtime["hybrid_service"] = nil
@@ -1110,7 +1087,7 @@ func (s *Server) search(c *gin.Context) {
 	}
 
 	// Per-request compile + retrieve (no LLM)
-	docs, err := s.retrieveAt(c.Request.Context(), s.kbRetriever, indexName, query, limit, s.cfg.MinScore, s.cfg.SearchMode)
+	docs, err := s.retrieveAt(c.Request.Context(), indexName, query, limit, s.cfg.MinScore, s.cfg.SearchMode)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -1224,7 +1201,7 @@ func (s *Server) searchMultiKB(c *gin.Context, query string, kbIDs []int64, limi
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			docs, err := s.retrieveAt(ctx, s.kbRetriever, idxName, query, limit, s.cfg.MinScore, s.cfg.SearchMode)
+			docs, err := s.retrieveAt(ctx, idxName, query, limit, s.cfg.MinScore, s.cfg.SearchMode)
 			results[idx] = searchResult{docs: docs, err: err}
 		}(i, kb.indexName)
 	}
@@ -1280,19 +1257,18 @@ func sortHitsByScore(hits []searchRawHit) {
 // and returns the raw *rag.RetrievedDoc slice. Used by /search and
 // /chat to do the retrieve step only; LLM generation is handled by
 // chat after this returns.
-// retrieveAt performs a search against the per-request indexName. The
-// eino-ext retriever is configured with SearchModeRawStringRequest, which
-// expects the query argument to be a complete ES query body JSON (NOT
-// plain text). So before calling kr.Retrieve we must:
+// retrieveAt performs a search against the per-request indexName. It
+// creates a per-index elastic_retriever bound to the target ES index
+// (no placeholder/WithIndex routing needed since we compile per-request).
+//
+// Steps:
 //  1. Embed the user's text query via s.embedder to get the dense vector
 //  2. Build the hybrid/knn/keyword ES body via rag.BuildHybridQueryJSON
-//  3. Hand that JSON body to kr.Retrieve as the "query" argument
-//
-// searchMode drives the body shape (hybrid/knn/rrf/keyword); topK and
-// minScore are passed through; weights default to rag.DefaultWeights.
-func (s *Server) retrieveAt(ctx context.Context, kr retriever.Retriever, indexName, query string, topK int, minScore float64, searchMode string) ([]*rag.RetrievedDoc, error) {
-	if kr == nil {
-		return nil, fmt.Errorf("retrieveAt: nil kbRetriever")
+//  3. Create a per-index retriever from s.esClient
+//  4. Retrieve with that retriever and map results to []*rag.RetrievedDoc
+func (s *Server) retrieveAt(ctx context.Context, indexName, query string, topK int, minScore float64, searchMode string) ([]*rag.RetrievedDoc, error) {
+	if s.esClient == nil {
+		return nil, fmt.Errorf("retrieveAt: nil esClient")
 	}
 	if s.embedder == nil {
 		return nil, fmt.Errorf("retrieveAt: nil embedder (cannot build hybrid query JSON)")
@@ -1314,9 +1290,22 @@ func (s *Server) retrieveAt(ctx context.Context, kr retriever.Retriever, indexNa
 		return nil, fmt.Errorf("retrieveAt: build query body: %w", err)
 	}
 
-	// 3. Hand the JSON body to eino-ext retriever. WithIndex closes over
-	// the per-request indexName inside the wrapper.
-	docs, err := kr.Retrieve(ctx, body, rag.WithIndexOpt(indexName), rag.WithTopKOpt(topK), rag.WithMinScoreOpt(minScore))
+	// 3. Create a per-index retriever bound to the target ES index.
+	scoreThreshold := minScore
+	retriever, err := elastic_retriever.NewRetriever(ctx, &elastic_retriever.RetrieverConfig{
+		Client:         s.esClient,
+		Index:          indexName,
+		TopK:           topK,
+		ScoreThreshold: &scoreThreshold,
+		SearchMode:     elastic_search_mode.SearchModeRawStringRequest(),
+		ResultParser:   rag.ProjectResultParser(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("retrieveAt: create retriever for %q: %w", indexName, err)
+	}
+
+	// 4. Retrieve using the per-index retriever (no WithIndex needed).
+	docs, err := retriever.Retrieve(ctx, body)
 	if err != nil {
 		return nil, err
 	}
@@ -1357,17 +1346,13 @@ func (s *Server) chat(c *gin.Context) {
 		limit = s.cfg.TopK
 	}
 
-	ctx := rag.WithKBParams(c.Request.Context(), rag.KBParams{
-		IndexNames: []string{indexName},
-		TopK:       limit,
-		MinScore:   s.cfg.MinScore,
-		SearchMode: s.cfg.SearchMode,
-	})
-	if s.preCompiledGraph == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "retrieval graph not compiled (missing components)"})
+	// Compile graph per-request with indexNames baked in.
+	chain, err := rag.BuildRetrievalGraph(c.Request.Context(), s.esClient, s.llm, s.embedder, []string{indexName}, limit, s.cfg.MinScore, s.cfg.SearchMode)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
-	answer, err := s.preCompiledGraph.Invoke(ctx, req.Query)
+	answer, err := chain.Invoke(c.Request.Context(), req.Query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -1411,17 +1396,13 @@ func (s *Server) chatMultiKB(c *gin.Context, req *rag.ChatRequest) {
 		return
 	}
 
-	ctx := rag.WithKBParams(c.Request.Context(), rag.KBParams{
-		IndexNames: indexNames,
-		TopK:       limit,
-		MinScore:   s.cfg.MinScore,
-		SearchMode: s.cfg.SearchMode,
-	})
-	if s.preCompiledGraph == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "retrieval graph not compiled (missing components)"})
+	// Compile graph per-request with all indexNames baked in.
+	chain, err := rag.BuildRetrievalGraph(c.Request.Context(), s.esClient, s.llm, s.embedder, indexNames, limit, s.cfg.MinScore, s.cfg.SearchMode)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
-	answer, err := s.preCompiledGraph.Invoke(ctx, req.Query)
+	answer, err := chain.Invoke(c.Request.Context(), req.Query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return

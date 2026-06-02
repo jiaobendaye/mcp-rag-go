@@ -18,7 +18,7 @@ import (
 
 const testDims = 4
 
-func setupIntegrationTest(t *testing.T) (*elastic_indexer.IndexerConfig, *KBRetriever, func()) {
+func setupIntegrationTest(t *testing.T) (*elastic_indexer.IndexerConfig, *elastic_retriever.Retriever, func()) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -50,7 +50,7 @@ func setupIntegrationTest(t *testing.T) (*elastic_indexer.IndexerConfig, *KBRetr
 		}
 	}
 
-	retriever, err := NewKBRetriever(context.Background(), &elastic_retriever.RetrieverConfig{
+	retriever, err := elastic_retriever.NewRetriever(context.Background(), &elastic_retriever.RetrieverConfig{
 		Client:       esClient,
 		Index:        indexName,
 		TopK:         5,
@@ -134,7 +134,7 @@ func TestIntegrationSearchEmptyIndex(t *testing.T) {
 	defer esClient.Indices.Delete([]string{indexName})
 
 	// Empty index: confirm we can build a retriever without error
-	_, err = NewKBRetriever(ctx, &elastic_retriever.RetrieverConfig{
+	_, err = elastic_retriever.NewRetriever(ctx, &elastic_retriever.RetrieverConfig{
 		Client:       esClient,
 		Index:        indexName,
 		TopK:         5,
