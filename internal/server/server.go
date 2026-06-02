@@ -47,7 +47,8 @@ type Server struct {
 	// Knowledge base service
 	kbs *knowledgebase.Service
 
-	embedDims int
+	embedDims       int
+	embeddingModel  string
 	classifier *rag.QueryClassifier
 
 	mcpSrv     *mcpserver.MCPServer
@@ -67,6 +68,7 @@ func New(
 	esClient *elasticsearch.Client,
 	kbs *knowledgebase.Service,
 	embedDims int,
+	embeddingModel string,
 ) (*Server, error) {
 	return &Server{
 		cfg:              cfg,
@@ -819,8 +821,12 @@ func (s *Server) addDocument(c *gin.Context) {
 
 	// Resolve KB. Body's req.KBID takes precedence over query ?kb_id=.
 	// resolveKB handles both: pass req.KBID (may be nil if neither set).
-	_, indexName, err := s.resolveKB(c, req.KBID)
+	resolution, indexName, err := s.resolveKB(c, req.KBID)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	if err := s.kbs.CheckEmbeddingMatch(resolution.KnowledgeBase); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
@@ -900,8 +906,12 @@ func (s *Server) uploadFiles(c *gin.Context) {
 	}
 
 	// Resolve the target KB once for the entire batch
-	_, indexName, err := s.resolveKB(c, nil)
+	resolution, indexName, err := s.resolveKB(c, nil)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	if err := s.kbs.CheckEmbeddingMatch(resolution.KnowledgeBase); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
@@ -1067,6 +1077,10 @@ func (s *Server) search(c *gin.Context) {
 	// Single KB
 	resolution, indexName, err := s.resolveKB(c, nil)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	if err := s.kbs.CheckEmbeddingMatch(resolution.KnowledgeBase); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
@@ -1335,8 +1349,12 @@ func (s *Server) chat(c *gin.Context) {
 	if req.KBID == nil {
 		req.KBID = parseIntPtr(c.Query("kb_id"))
 	}
-	_, indexName, err := s.resolveKBFromChat(&req)
+	resolution, indexName, err := s.resolveKBFromChat(&req)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	if err := s.kbs.CheckEmbeddingMatch(resolution.KnowledgeBase); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}

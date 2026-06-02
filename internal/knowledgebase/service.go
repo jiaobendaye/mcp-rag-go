@@ -4,7 +4,9 @@ import "fmt"
 
 // Service provides higher-level knowledge base resolution with default creation.
 type Service struct {
-	store *Store
+	store          *Store
+	embeddingModel string
+	embeddingDims  int
 }
 
 // NewService creates a knowledge base service.
@@ -16,6 +18,25 @@ func NewService(dbPath string) (*Service, error) {
 	return &Service{store: store}, nil
 }
 
+// SetEmbeddingInfo records the current embedding model and dims for use
+// when creating new KBs and checking existing KB compatibility.
+func (s *Service) SetEmbeddingInfo(model string, dims int) {
+	s.embeddingModel = model
+	s.embeddingDims = dims
+}
+
+// CheckEmbeddingMatch returns an error if the KB's embedding info does not
+// match the current embedder.
+func (s *Service) CheckEmbeddingMatch(kb *KnowledgeBase) error {
+	if kb.EmbeddingDims != s.embeddingDims {
+		return fmt.Errorf("KB %q embedding dims mismatch: KB=%d, current=%d", kb.Name, kb.EmbeddingDims, s.embeddingDims)
+	}
+	if kb.EmbeddingModel != s.embeddingModel {
+		return fmt.Errorf("KB %q embedding model mismatch: KB=%s, current=%s", kb.Name, kb.EmbeddingModel, s.embeddingModel)
+	}
+	return nil
+}
+
 // EnsurePublicDefault returns the public default KB, creating it if needed.
 func (s *Service) EnsurePublicDefault() (*KnowledgeBase, error) {
 	kb, err := s.store.GetPublicDefault()
@@ -25,7 +46,7 @@ func (s *Service) EnsurePublicDefault() (*KnowledgeBase, error) {
 	if kb != nil {
 		return kb, nil
 	}
-	return s.store.Create("公共知识库", string(ScopePublic), nil, nil)
+	return s.store.Create("公共知识库", string(ScopePublic), nil, nil, s.embeddingModel, s.embeddingDims)
 }
 
 // EnsureAgentPrivateDefault returns the agent-private default KB, creating it if needed.
@@ -41,12 +62,13 @@ func (s *Service) EnsureAgentPrivateDefault(userID, agentID int64) (*KnowledgeBa
 		fmt.Sprintf("Agent %d 知识库", agentID),
 		string(ScopeAgentPrivate),
 		ptr(userID), ptr(agentID),
+		s.embeddingModel, s.embeddingDims,
 	)
 }
 
 // Create inserts a new knowledge base with the given parameters.
 func (s *Service) Create(name, scope string, ownerUserID, ownerAgentID *int64) (*KnowledgeBase, error) {
-	return s.store.Create(name, scope, ownerUserID, ownerAgentID)
+	return s.store.Create(name, scope, ownerUserID, ownerAgentID, s.embeddingModel, s.embeddingDims)
 }
 
 // ListAccessible returns all KBs accessible to the given user, including defaults.
@@ -98,7 +120,7 @@ func (s *Service) Resolve(req ResolveRequest) (*Resolution, error) {
 			return &Resolution{KnowledgeBase: kb, SelectedVia: "collection"}, nil
 		}
 		// Auto-create (like Python's ChromaDB auto-creating a collection)
-		kb, err = s.store.Create(*req.Collection, string(scope), req.UserID, req.AgentID)
+		kb, err = s.store.Create(*req.Collection, string(scope), req.UserID, req.AgentID, s.embeddingModel, s.embeddingDims)
 		if err != nil {
 			return nil, err
 		}

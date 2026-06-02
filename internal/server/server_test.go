@@ -50,7 +50,7 @@ func setupTestServer() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	cfg := config.DefaultConfig()
 	emb := &httpTestEmbedder{}
-	s, _ := New(cfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, nil, nil, 0)
+	s, _ := New(cfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, nil, nil, 0, "test-model")
 	return s.Setup()
 }
 
@@ -66,7 +66,7 @@ func setupTestServerWithKB(t *testing.T) (*gin.Engine, *knowledgebase.Service) {
 		t.Fatalf("knowledgebase.NewService: %v", err)
 	}
 	emb := &httpTestEmbedder{}
-	s, _ := New(cfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, nil, svc, 0)
+	s, _ := New(cfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, nil, svc, 0, "test-model")
 	return s.Setup(), svc
 }
 

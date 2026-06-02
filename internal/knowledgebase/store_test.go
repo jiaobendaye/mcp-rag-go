@@ -12,7 +12,7 @@ func TestStoreCreateAndGet(t *testing.T) {
 		t.Fatalf("NewStore: %v", err)
 	}
 
-	kb, err := store.Create("test", "public", nil, nil)
+	kb, err := store.Create("test", "public", nil, nil, "test-model", 128)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestStoreGetByName(t *testing.T) {
 	aid := int64(456)
 
 	// Create a KB with specific owner
-	kb, err := store.Create("my_project", "agent_private", &uid, &aid)
+	kb, err := store.Create("my_project", "agent_private", &uid, &aid, "test-model", 128)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestStoreGetByName(t *testing.T) {
 	}
 
 	// Public KB with nil owners
-	pubKB, err := store.Create("shared", "public", nil, nil)
+	pubKB, err := store.Create("shared", "public", nil, nil, "test-model", 128)
 	if err != nil {
 		t.Fatalf("Create public: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestEnsureAccess(t *testing.T) {
 	otherUID := int64(999)
 
 	// Create a private KB
-	kb, err := svc.store.Create("private_kb", "agent_private", &uid, nil)
+	kb, err := svc.store.Create("private_kb", "agent_private", &uid, nil, "test-model", 128)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestEnsureAccess(t *testing.T) {
 	}
 
 	// Public KB is accessible to anyone
-	pubKB, err := svc.store.Create("public_kb", "public", nil, nil)
+	pubKB, err := svc.store.Create("public_kb", "public", nil, nil, "test-model", 128)
 	if err != nil {
 		t.Fatalf("Create public: %v", err)
 	}
@@ -313,5 +313,38 @@ func TestEnsureAccess(t *testing.T) {
 	_, err = svc.Resolve(ResolveRequest{KBID: &kbID, UserID: &otherUID})
 	if err == nil {
 		t.Error("expected access denied for non-owner")
+	}
+}
+
+func TestCheckEmbeddingMatch_Match(t *testing.T) {
+	svc := &Service{embeddingModel: "mxbai-embed-large", embeddingDims: 1024}
+	kb := &KnowledgeBase{Name: "test", EmbeddingModel: "mxbai-embed-large", EmbeddingDims: 1024}
+	if err := svc.CheckEmbeddingMatch(kb); err != nil {
+		t.Fatalf("expected match, got error: %v", err)
+	}
+}
+
+func TestCheckEmbeddingMatch_DimsMismatch(t *testing.T) {
+	svc := &Service{embeddingModel: "mxbai-embed-large", embeddingDims: 1024}
+	kb := &KnowledgeBase{Name: "test", EmbeddingModel: "mxbai-embed-large", EmbeddingDims: 768}
+	if err := svc.CheckEmbeddingMatch(kb); err == nil {
+		t.Fatal("expected dims mismatch error")
+	}
+}
+
+func TestCheckEmbeddingMatch_ModelMismatch(t *testing.T) {
+	svc := &Service{embeddingModel: "mxbai-embed-large", embeddingDims: 1024}
+	kb := &KnowledgeBase{Name: "test", EmbeddingModel: "bge-m3", EmbeddingDims: 1024}
+	if err := svc.CheckEmbeddingMatch(kb); err == nil {
+		t.Fatal("expected model mismatch error")
+	}
+}
+
+
+func TestSetEmbeddingInfo(t *testing.T) {
+	svc := &Service{}
+	svc.SetEmbeddingInfo("test-model", 512)
+	if svc.embeddingModel != "test-model" || svc.embeddingDims != 512 {
+		t.Fatalf("SetEmbeddingInfo: got (%s, %d)", svc.embeddingModel, svc.embeddingDims)
 	}
 }

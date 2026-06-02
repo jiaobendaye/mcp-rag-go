@@ -67,7 +67,7 @@ func setupSecureServer(securityCfg *config.Config) *gin.Engine {
 
 	emb := &httpTestEmbedder{}
 
-	s, _ := New(securityCfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, nil, nil, 0)
+	s, _ := New(securityCfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, nil, nil, 0, "test-model")
 	return s.Setup()
 }
 

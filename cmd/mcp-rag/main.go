@@ -22,6 +22,7 @@ import (
 	"github.com/cloudwego/eino-ext/components/document/transformer/splitter/recursive"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
+	swappable "github.com/jiaobendaye/mcp-rag-go/internal/embedder"
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
 	"github.com/jiaobendaye/mcp-rag-go/internal/observability"
 	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
@@ -119,8 +120,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	log.Printf("Default KB: %s (%s)", defaultKB.Name, defaultKB.IndexName())
 
-	// eino-ext embedder
-	embedder, err := openaiembed.NewEmbedder(ctx, &openaiembed.EmbeddingConfig{
+	// eino-ext embedder (wrapped in SwappableEmbedder for future hot-swap)
+	rawEmbedder, err := openaiembed.NewEmbedder(ctx, &openaiembed.EmbeddingConfig{
 		BaseURL: cfg.EmbeddingBaseURL,
 		APIKey:  cfg.EmbeddingAPIKey,
 		Model:   cfg.EmbeddingModel,
@@ -130,12 +131,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Probe dims
-	vecs, err := embedder.EmbedStrings(ctx, []string{"probe"})
+	vecs, err := rawEmbedder.EmbedStrings(ctx, []string{"probe"})
 	if err != nil {
 		return fmt.Errorf("probe embedding: %w", err)
 	}
 	dims := len(vecs[0])
 	log.Printf("Embedding dims: %d", dims)
+
+	// Wrap in swappable proxy for future hot-swap support
+	embedder := swappable.NewSwappableEmbedder(rawEmbedder)
+
+	// Record embedding info on KB service so newly-created KBs are bound to this model
+	kbService.SetEmbeddingInfo(cfg.EmbeddingModel, dims)
 
 	// Splitter (used as a transformer template by per-request compile)
 	splitter, err := newSplitter(ctx, cfg.ChunkSize, cfg.ChunkOverlap)
@@ -164,7 +171,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Setup HTTP
 	gin.SetMode(gin.ReleaseMode)
 	srv, err := server.New(cfg, configManager, metricsCollector, retrievalCache,
-		embedder, splitter, llm, indexerConf, esClient, kbService, dims)
+		embedder, splitter, llm, indexerConf, esClient, kbService, dims, cfg.EmbeddingModel)
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
 	}

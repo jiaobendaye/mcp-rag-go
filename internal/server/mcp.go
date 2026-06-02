@@ -113,9 +113,12 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 	}
 
 	// Resolve KB
-	_, indexName, err := s.resolveMCPKB(kbID, scope, userID, agentID, request.GetString("collection", ""))
+	resolution, indexName, err := s.resolveMCPKB(kbID, scope, userID, agentID, request.GetString("collection", ""))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("知识库解析失败: %v", err)), nil
+	}
+	if err := s.kbs.CheckEmbeddingMatch(resolution.KnowledgeBase); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("embedding mismatch: %v", err)), nil
 	}
 
 	switch mode {

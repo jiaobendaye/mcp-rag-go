@@ -16,6 +16,8 @@ type KnowledgeBase struct {
 	OwnerUserID    *int64  `json:"owner_user_id"`
 	OwnerAgentID   *int64  `json:"owner_agent_id"`
 	CollectionName string  `json:"collection_name"`
+	EmbeddingModel string  `json:"embedding_model"`
+	EmbeddingDims  int     `json:"embedding_dims"`
 	Status         string  `json:"status"`
 	CreatedAt      string  `json:"created_at"`
 	UpdatedAt      string  `json:"updated_at"`

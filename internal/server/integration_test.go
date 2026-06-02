@@ -163,7 +163,7 @@ func setupIntegrationServer(t *testing.T) (*gin.Engine, *knowledgebase.Service, 
 	}
 
 	gin.SetMode(gin.TestMode)
-	s, err := New(cfg, nil, nil, nil, embedder, splitter, llm, indexerConf, esClient, kbService, dims)
+	s, err := New(cfg, nil, nil, nil, embedder, splitter, llm, indexerConf, esClient, kbService, dims, "test-model")
 	if err != nil {
 		t.Fatalf("create server: %v", err)
 	}
