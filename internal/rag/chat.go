@@ -8,7 +8,6 @@ import (
 // ChatRequest contains the input for a chat request.
 type ChatRequest struct {
 	Query               string  `json:"query"`
-	Collection          string  `json:"collection,omitempty"`
 	KBID                *int64  `json:"kb_id,omitempty"`
 	KBIDs               []int64 `json:"kb_ids,omitempty"`
 	Limit               int     `json:"limit,omitempty"`
@@ -19,14 +18,6 @@ type ChatRequest struct {
 	PreRetrievedContext string  `json:"-"` // pre-built context for multi-KB mode
 }
 
-// ChatResponse contains the result of a chat request (compatible with Python MCP-RAG format).
-type ChatResponse struct {
-	Query      string      `json:"query"`
-	Collection string      `json:"collection"`
-	Response   string      `json:"response"`
-	Sources    []SearchHit `json:"sources"`
-}
-
 // SearchRequest contains the input for a search request.
 type SearchRequest struct {
 	Query    string  `json:"query"`
@@ -34,7 +25,7 @@ type SearchRequest struct {
 	MinScore float64 `json:"min_score,omitempty"`
 }
 
-// SearchResponse contains the result of a search request (compatible with Python MCP-RAG format).
+// SearchResponse contains the result of a search request.
 type SearchResponse struct {
 	Query      string      `json:"query"`
 	Collection string      `json:"collection"`

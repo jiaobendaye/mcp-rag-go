@@ -31,9 +31,6 @@ func (s *Server) InitMCP() (*mcpserver.MCPServer, *mcpserver.StreamableHTTPServe
 		mcp.WithString("mode",
 			mcp.Description("模式: raw (仅检索) 或 summary (检索+LLM总结)，默认raw"),
 		),
-		mcp.WithString("collection",
-			mcp.Description("知识库名称 (向后兼容)"),
-		),
 		mcp.WithInteger("kb_id",
 			mcp.Description("知识库ID"),
 		),
@@ -83,7 +80,6 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 	}
 
 	mode := request.GetString("mode", "raw")
-	collection := request.GetString("collection", "default")
 
 	kbID := request.GetInt("kb_id", 0)
 	kbIDsRaw := extractKBIDsArg(request.Params.Arguments)
@@ -114,7 +110,7 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 	}
 
 	// Resolve KB
-	_, indexName, err := s.resolveMCPKB(kbID, scope, userID, agentID, collection)
+	_, indexName, err := s.resolveMCPKB(kbID, scope, userID, agentID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("知识库解析失败: %v", err)), nil
 	}
@@ -128,7 +124,7 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 }
 
 // resolveMCPKB resolves KB from MCP parameters.
-func (s *Server) resolveMCPKB(kbID int, scope string, userID, agentID int, collection string) (*knowledgebase.Resolution, string, error) {
+func (s *Server) resolveMCPKB(kbID int, scope string, userID, agentID int) (*knowledgebase.Resolution, string, error) {
 	var kbIDPtr *int64
 	if kbID > 0 {
 		id := int64(kbID)
@@ -152,18 +148,11 @@ func (s *Server) resolveMCPKB(kbID int, scope string, userID, agentID int, colle
 		agentIDPtr = &aid
 	}
 
-	legacyKey := ""
-	if kbIDPtr == nil && scopePtr == nil {
-		legacyKey = "legacy:public:" + collection
-	}
-
 	resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{
-		KBID:              kbIDPtr,
-		Scope:             scopePtr,
-		UserID:            userIDPtr,
-		AgentID:           agentIDPtr,
-		LegacyCollection:  &collection,
-		LegacyCollectionKey: &legacyKey,
+		KBID:    kbIDPtr,
+		Scope:   scopePtr,
+		UserID:  userIDPtr,
+		AgentID: agentIDPtr,
 	})
 	if err != nil {
 		return nil, "", err

@@ -175,7 +175,7 @@ func (s *Server) Setup() *gin.Engine {
 	return r
 }
 
-// resolveKB resolves kb_id or legacy collection to a concrete ES index.
+// resolveKB resolves kb_id to a concrete ES index.
 // bodyKBID is an optional explicit kb_id supplied by the caller (e.g. from
 // a JSON request body); if non-nil it takes precedence over the URL query
 // `kb_id` parameter. Pass nil to read from the URL query only.
@@ -189,21 +189,11 @@ func (s *Server) resolveKB(c *gin.Context, bodyKBID *int64) (*knowledgebase.Reso
 		kbID = parseIntPtr(c.Query("kb_id"))
 	}
 	scope := strPtr(c.Query("scope"))
-	collection := c.Query("collection")
-	if collection == "" {
-		collection = c.DefaultQuery("collection", "default")
-	}
 	userID := parseIntPtr(c.Query("user_id"))
 	agentID := parseIntPtr(c.Query("agent_id"))
 
-	legacyKey := ""
-	if kbID == nil && scope == nil {
-		legacyKey = "legacy:public:" + collection
-	}
-
 	resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{
 		KBID: kbID, Scope: scope, UserID: userID, AgentID: agentID,
-		LegacyCollection: &collection, LegacyCollectionKey: &legacyKey,
 	})
 	if err != nil {
 		return nil, "", err
@@ -791,21 +781,8 @@ func (s *Server) createKnowledgeBase(c *gin.Context) {
 		req.Scope = "public"
 	}
 
-	legacyKey := fmt.Sprintf("legacy:%s:%s", req.Scope, req.Name)
-
-	// Try find existing KB by legacy key
-	kb, err := s.kbs.GetByLegacyKey(legacyKey)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
-		return
-	}
-	if kb != nil {
-		c.JSON(http.StatusOK, kb)
-		return
-	}
-
 	// Create new KB
-	kb, err = s.kbs.Create(req.Name, req.Scope, req.OwnerUserID, req.OwnerAgentID, &legacyKey)
+	kb, err := s.kbs.Create(req.Name, req.Scope, req.OwnerUserID, req.OwnerAgentID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -814,7 +791,7 @@ func (s *Server) createKnowledgeBase(c *gin.Context) {
 	c.JSON(http.StatusOK, kb)
 }
 
-// listCollections returns legacy collection names (backward compat).
+// listCollections returns collection names for all accessible KBs.
 func (s *Server) listCollections(c *gin.Context) {
 	userID := parseIntPtr(c.Query("user_id"))
 	kbs, err := s.kbs.ListAccessible(userID)
@@ -1465,23 +1442,11 @@ func (s *Server) resolveKBFromChat(req *rag.ChatRequest) (*knowledgebase.Resolut
 		scopePtr = &scope
 	}
 
-	collection := req.Collection
-	if collection == "" {
-		collection = "default"
-	}
-
-	legacyKey := ""
-	if req.KBID == nil && scopePtr == nil {
-		legacyKey = "legacy:public:" + collection
-	}
-
 	resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{
-		KBID:               req.KBID,
-		Scope:              scopePtr,
-		UserID:             req.UserID,
-		AgentID:            req.AgentID,
-		LegacyCollection:   &collection,
-		LegacyCollectionKey: &legacyKey,
+		KBID:    req.KBID,
+		Scope:   scopePtr,
+		UserID:  req.UserID,
+		AgentID: req.AgentID,
 	})
 	if err != nil {
 		return nil, "", err

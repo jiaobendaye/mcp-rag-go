@@ -37,7 +37,6 @@ func (s *Store) initialize() error {
 			owner_user_id INTEGER,
 			owner_agent_id INTEGER,
 			collection_name TEXT NOT NULL UNIQUE,
-			legacy_collection_key TEXT UNIQUE,
 			status TEXT NOT NULL DEFAULT 'active',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
@@ -55,19 +54,8 @@ func (s *Store) Get(kbID int64) (*KnowledgeBase, error) {
 
 func (s *Store) get(kbID int64) (*KnowledgeBase, error) {
 	row := s.db.QueryRow(
-		"SELECT id, name, scope, owner_user_id, owner_agent_id, collection_name, legacy_collection_key, status, created_at, updated_at FROM knowledge_bases WHERE id=?",
+		"SELECT id, name, scope, owner_user_id, owner_agent_id, collection_name, status, created_at, updated_at FROM knowledge_bases WHERE id=?",
 		kbID,
-	)
-	return scanKB(row)
-}
-
-// GetByLegacyKey looks up a knowledge base by its legacy collection key.
-func (s *Store) GetByLegacyKey(key string) (*KnowledgeBase, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	row := s.db.QueryRow(
-		"SELECT id, name, scope, owner_user_id, owner_agent_id, collection_name, legacy_collection_key, status, created_at, updated_at FROM knowledge_bases WHERE legacy_collection_key=?",
-		key,
 	)
 	return scanKB(row)
 }
@@ -77,7 +65,7 @@ func (s *Store) GetPublicDefault() (*KnowledgeBase, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	row := s.db.QueryRow(
-		"SELECT id, name, scope, owner_user_id, owner_agent_id, collection_name, legacy_collection_key, status, created_at, updated_at FROM knowledge_bases WHERE scope='public' AND owner_user_id IS NULL AND owner_agent_id IS NULL AND status='active' ORDER BY id ASC LIMIT 1",
+		"SELECT id, name, scope, owner_user_id, owner_agent_id, collection_name, status, created_at, updated_at FROM knowledge_bases WHERE scope='public' AND owner_user_id IS NULL AND owner_agent_id IS NULL AND status='active' ORDER BY id ASC LIMIT 1",
 	)
 	return scanKB(row)
 }
@@ -87,7 +75,7 @@ func (s *Store) GetAgentPrivateDefault(userID, agentID int64) (*KnowledgeBase, e
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	row := s.db.QueryRow(
-		"SELECT id, name, scope, owner_user_id, owner_agent_id, collection_name, legacy_collection_key, status, created_at, updated_at FROM knowledge_bases WHERE scope='agent_private' AND owner_user_id=? AND owner_agent_id=? AND status='active' ORDER BY id ASC LIMIT 1",
+		"SELECT id, name, scope, owner_user_id, owner_agent_id, collection_name, status, created_at, updated_at FROM knowledge_bases WHERE scope='agent_private' AND owner_user_id=? AND owner_agent_id=? AND status='active' ORDER BY id ASC LIMIT 1",
 		userID, agentID,
 	)
 	return scanKB(row)
@@ -98,7 +86,7 @@ func (s *Store) ListAccessible(userID *int64) ([]*KnowledgeBase, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(
-		"SELECT id, name, scope, owner_user_id, owner_agent_id, collection_name, legacy_collection_key, status, created_at, updated_at FROM knowledge_bases WHERE status='active' AND (scope='public' OR (? IS NOT NULL AND owner_user_id=?)) ORDER BY CASE WHEN scope='public' THEN 0 ELSE 1 END, name COLLATE NOCASE ASC, id ASC",
+		"SELECT id, name, scope, owner_user_id, owner_agent_id, collection_name, status, created_at, updated_at FROM knowledge_bases WHERE status='active' AND (scope='public' OR (? IS NOT NULL AND owner_user_id=?)) ORDER BY CASE WHEN scope='public' THEN 0 ELSE 1 END, name COLLATE NOCASE ASC, id ASC",
 		userID, userID,
 	)
 	if err != nil {
@@ -109,7 +97,7 @@ func (s *Store) ListAccessible(userID *int64) ([]*KnowledgeBase, error) {
 }
 
 // Create inserts a new knowledge base and returns it with the assigned ID.
-func (s *Store) Create(name, scope string, ownerUserID, ownerAgentID *int64, legacyKey *string) (*KnowledgeBase, error) {
+func (s *Store) Create(name, scope string, ownerUserID, ownerAgentID *int64) (*KnowledgeBase, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -117,8 +105,8 @@ func (s *Store) Create(name, scope string, ownerUserID, ownerAgentID *int64, leg
 	tmpColl := fmt.Sprintf("pending_%s", now[:10]) // placeholder
 
 	result, err := s.db.Exec(
-		"INSERT INTO knowledge_bases(name, scope, owner_user_id, owner_agent_id, collection_name, legacy_collection_key, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-		name, scope, ownerUserID, ownerAgentID, tmpColl, legacyKey, "active", now, now,
+		"INSERT INTO knowledge_bases(name, scope, owner_user_id, owner_agent_id, collection_name, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+		name, scope, ownerUserID, ownerAgentID, tmpColl, "active", now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert kb: %w", err)
@@ -136,7 +124,7 @@ func (s *Store) Create(name, scope string, ownerUserID, ownerAgentID *int64, leg
 
 func scanKB(row *sql.Row) (*KnowledgeBase, error) {
 	var kb KnowledgeBase
-	err := row.Scan(&kb.ID, &kb.Name, &kb.Scope, &kb.OwnerUserID, &kb.OwnerAgentID, &kb.CollectionName, &kb.LegacyCollectionKey, &kb.Status, &kb.CreatedAt, &kb.UpdatedAt)
+	err := row.Scan(&kb.ID, &kb.Name, &kb.Scope, &kb.OwnerUserID, &kb.OwnerAgentID, &kb.CollectionName, &kb.Status, &kb.CreatedAt, &kb.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -150,7 +138,7 @@ func scanKBs(rows *sql.Rows) ([]*KnowledgeBase, error) {
 	var kbs []*KnowledgeBase
 	for rows.Next() {
 		var kb KnowledgeBase
-		if err := rows.Scan(&kb.ID, &kb.Name, &kb.Scope, &kb.OwnerUserID, &kb.OwnerAgentID, &kb.CollectionName, &kb.LegacyCollectionKey, &kb.Status, &kb.CreatedAt, &kb.UpdatedAt); err != nil {
+		if err := rows.Scan(&kb.ID, &kb.Name, &kb.Scope, &kb.OwnerUserID, &kb.OwnerAgentID, &kb.CollectionName, &kb.Status, &kb.CreatedAt, &kb.UpdatedAt); err != nil {
 			return nil, err
 		}
 		kbs = append(kbs, &kb)

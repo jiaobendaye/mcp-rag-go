@@ -492,9 +492,7 @@ func TestCreateKnowledgeBase_TableDriven(t *testing.T) {
 		},
 	}
 
-	var firstCreatedID int64
-
-	for i, tt := range tests {
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r, _ := setupTestServerWithKB(t)
 
@@ -524,31 +522,20 @@ func TestCreateKnowledgeBase_TableDriven(t *testing.T) {
 				t.Errorf("expected scope=%s, got %v", tt.wantScope, resp["scope"])
 			}
 
-			if i == 0 {
-				// Capture the first created ID for hit-return test verification
-				switch id := resp["id"].(type) {
-				case float64:
-					firstCreatedID = int64(id)
-				case int64:
-					firstCreatedID = id
-				}
-			}
 		})
 	}
 
-	// Verify that the "name hit" subtest returned the same ID as the first
-	// creation. Re-run a sub-request against a fresh server but pre-seeded.
-	t.Run("hit-returns-same-id", func(t *testing.T) {
+	// Verify that creating a KB with the same name creates a new KB
+	// (no legacy key dedup — each creation is independent).
+	t.Run("same-name-creates-new-kb", func(t *testing.T) {
 		r, svc := setupTestServerWithKB(t)
-		// Pre-seed a KB with the same legacy key the handler will look up
-		legacyKey := "legacy:public:seeded"
-		kb, err := svc.Create("seeded", "public", nil, nil, &legacyKey)
+		// Pre-seed a KB
+		kb, err := svc.Create("seeded", "public", nil, nil)
 		if err != nil {
 			t.Fatalf("seed create: %v", err)
 		}
-		_ = firstCreatedID // captured but used implicitly below
 
-		// Request with the seeded name should hit GetByLegacyKey path
+		// Creating one with the same name should succeed (no legacy dedup)
 		w := httptest.NewRecorder()
 		req, _ := http.NewRequest("POST", "/knowledge-bases", strings.NewReader(`{"name": "seeded", "scope": "public"}`))
 		req.Header.Set("Content-Type", "application/json")
@@ -559,8 +546,8 @@ func TestCreateKnowledgeBase_TableDriven(t *testing.T) {
 		var resp map[string]any
 		json.NewDecoder(w.Body).Decode(&resp)
 		gotID := int64(resp["id"].(float64))
-		if gotID != kb.ID {
-			t.Errorf("expected existing KB id=%d, got %d", kb.ID, gotID)
+		if gotID == kb.ID {
+			t.Errorf("expected new KB (different ID), got same ID=%d", gotID)
 		}
 	})
 }
@@ -672,11 +659,11 @@ func TestSearch_KBIDs_MultiKB(t *testing.T) {
 	r, svc := setupTestServerWithKB(t)
 
 	// Pre-seed 2 KBs
-	kb1, err := svc.Create("multi-1", "public", nil, nil, nil)
+	kb1, err := svc.Create("multi-1", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb1: %v", err)
 	}
-	kb2, err := svc.Create("multi-2", "public", nil, nil, nil)
+	kb2, err := svc.Create("multi-2", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb2: %v", err)
 	}

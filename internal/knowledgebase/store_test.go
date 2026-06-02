@@ -12,7 +12,7 @@ func TestStoreCreateAndGet(t *testing.T) {
 		t.Fatalf("NewStore: %v", err)
 	}
 
-	kb, err := store.Create("test", "public", nil, nil, ptr("legacy:test"))
+	kb, err := store.Create("test", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

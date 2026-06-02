@@ -291,8 +291,7 @@ func TestAddDocument_RoutesToResolvedKB(t *testing.T) {
 	bodyA := `{"content":"Go语言是由Google开发的静态类型编译型语言。"}`
 	bodyB := `{"content":"React和TypeScript是构建现代前端应用的主流技术。"}`
 
-	// Add bodyA to default KB (no kb_id → resolved to default via legacy
-	// collection key)
+	// Add bodyA to default KB (no kb_id → resolved to default by scope
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/add-document", strings.NewReader(bodyA))
 	req.Header.Set("Content-Type", "application/json")
@@ -302,8 +301,7 @@ func TestAddDocument_RoutesToResolvedKB(t *testing.T) {
 	}
 
 	// Create a second KB explicitly
-	legacyKey := "legacy:public:kb2"
-	kb2, err := kbSvc.Create("kb2", "public", nil, nil, &legacyKey)
+	kb2, err := kbSvc.Create("kb2", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb2: %v", err)
 	}
@@ -356,13 +354,11 @@ func TestSearchMultiKB_RealSearch(t *testing.T) {
 	r, kbSvc, esClient := setupIntegrationServer(t)
 
 	// Seed two additional KBs with distinct content
-	legacyKey1 := "legacy:public:multi1"
-	kb1, err := kbSvc.Create("multi1", "public", nil, nil, &legacyKey1)
+	kb1, err := kbSvc.Create("multi1", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb1: %v", err)
 	}
-	legacyKey2 := "legacy:public:multi2"
-	kb2, err := kbSvc.Create("multi2", "public", nil, nil, &legacyKey2)
+	kb2, err := kbSvc.Create("multi2", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb2: %v", err)
 	}
@@ -453,13 +449,11 @@ func TestAddDocument_BodyKBID(t *testing.T) {
 	r, kbSvc, _ := setupIntegrationServer(t)
 
 	// Create two KBs
-	legacyKeyA := "legacy:public:body_kb_a"
-	kba, err := kbSvc.Create("body_kb_a", "public", nil, nil, &legacyKeyA)
+	kba, err := kbSvc.Create("body_kb_a", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb_a: %v", err)
 	}
-	legacyKeyB := "legacy:public:body_kb_b"
-	kbb, err := kbSvc.Create("body_kb_b", "public", nil, nil, &legacyKeyB)
+	kbb, err := kbSvc.Create("body_kb_b", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb_b: %v", err)
 	}
@@ -524,8 +518,7 @@ func TestChat_SingleKB(t *testing.T) {
 	r, kbSvc, esClient := setupIntegrationServer(t)
 
 	// Seed a KB with content
-	legacyKey := "legacy:public:chat_test"
-	kb, err := kbSvc.Create("chat_test", "public", nil, nil, &legacyKey)
+	kb, err := kbSvc.Create("chat_test", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb: %v", err)
 	}
@@ -619,8 +612,7 @@ func TestMCP_RawMode_SingleKB(t *testing.T) {
 	r, kbSvc, _ := setupIntegrationServer(t)
 
 	// Seed a KB
-	legacyKey := "legacy:public:mcp_raw"
-	kb, err := kbSvc.Create("mcp_raw", "public", nil, nil, &legacyKey)
+	kb, err := kbSvc.Create("mcp_raw", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb: %v", err)
 	}
@@ -678,13 +670,11 @@ func TestMCP_RawMode_MultiKB(t *testing.T) {
 	r, kbSvc, esClient := setupIntegrationServer(t)
 
 	// Create two KBs
-	legacyKey1 := "legacy:public:mcp_multi_a"
-	kba, err := kbSvc.Create("mcp_multi_a", "public", nil, nil, &legacyKey1)
+	kba, err := kbSvc.Create("mcp_multi_a", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb_a: %v", err)
 	}
-	legacyKey2 := "legacy:public:mcp_multi_b"
-	kbb, err := kbSvc.Create("mcp_multi_b", "public", nil, nil, &legacyKey2)
+	kbb, err := kbSvc.Create("mcp_multi_b", "public", nil, nil)
 	if err != nil {
 		t.Fatalf("create kb_b: %v", err)
 	}
