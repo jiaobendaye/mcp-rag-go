@@ -10,6 +10,10 @@ import (
 	elastic_retriever "github.com/cloudwego/eino-ext/components/retriever/es8"
 )
 
+// PlaceholderIndex is a sentinel name that signals "no real index bound
+// at construction time".
+const PlaceholderIndex = "__rag_placeholder__"
+
 // KBRetriever wraps eino-ext's *elastic_retriever.Retriever to support
 // per-call index routing. eino-ext's underlying retriever uses
 // r.config.Index in the search call rather than honoring the WithIndex

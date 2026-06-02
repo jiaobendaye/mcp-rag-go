@@ -6,74 +6,104 @@ package testutil
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"os/exec"
 	"sync"
+	"testing"
 	"time"
-
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 const (
-	// esImage matches the go-elasticsearch v8.19.x client version.
-	esImage = "docker.io/elasticsearch:8.19.6"
-	esPort  = "9200/tcp"
+	esImage       = "elasticsearch:8.16.1"
+	esHostPort    = "9200"
+	esName        = "mcp-rag-itest-es"
+	esStartupWait = 60 * time.Second
 )
+
+const esURL = "http://localhost:" + esHostPort
 
 var (
 	esOnce     sync.Once
-	esURL      string
 	esStartErr error
 )
 
-// GetESURL returns the URL of an ephemeral Elasticsearch container.
-// The container is started once per test process (sync.Once), so
-// multiple packages calling this during the same go test run share
-// a single container.
+// StartES starts an ephemeral Elasticsearch container (one per test
+// run — sync.Once per process, reuses existing container across
+// packages via reuseIfHealthy). Returns the ES URL.
 //
-// Callers should skip the test if the returned error is non-nil
-// (e.g., Docker unavailable in CI).
-func GetESURL(ctx context.Context) (string, error) {
+// Uses docker CLI directly (no testcontainers-go) to avoid pulling
+// the ryuk sidecar from Docker Hub.
+func StartES(t *testing.T, ctx context.Context) (string, error) {
+	t.Helper()
 	esOnce.Do(func() {
-		esURL, esStartErr = startESContainer(ctx)
+		esStartErr = startES(ctx)
 	})
 	return esURL, esStartErr
 }
 
-func startESContainer(ctx context.Context) (string, error) {
-	req := testcontainers.ContainerRequest{
-		Image: esImage,
-		Env: map[string]string{
-			"discovery.type":         "single-node",
-			"xpack.security.enabled": "false",
-			"ES_JAVA_OPTS":           "-Xms512m -Xmx512m",
-		},
-		ExposedPorts: []string{esPort},
-		WaitingFor: wait.ForHTTP("/").
-			WithPort(esPort).
-			WithStartupTimeout(120*time.Second).
-			WithStatusCodeMatcher(func(status int) bool {
-				return status < 500
-			}),
+// StopES removes the ephemeral ES container.
+func StopES() {
+	exec.Command("docker", "rm", "-f", esName).Run()
+}
+
+func startES(ctx context.Context) error {
+	// If the named container is already running and healthy (e.g. from a
+	// previous package in the same test run), reuse it.
+	if reuseIfHealthy(ctx) {
+		return nil
 	}
 
-	container, err := testcontainers.GenericContainer(ctx,
-		testcontainers.GenericContainerRequest{
-			ContainerRequest: req,
-			Started:          true,
-		})
+	// Remove any leftover stopped container with the same name.
+	exec.Command("docker", "rm", "-f", esName).Run()
+
+	runCmd := exec.CommandContext(ctx, "docker", "run",
+		"-d",
+		"--name", esName,
+		"-p", esHostPort+":"+esHostPort,
+		"-e", "discovery.type=single-node",
+		"-e", "xpack.security.enabled=false",
+		"-e", "ES_JAVA_OPTS=-Xms512m -Xmx512m",
+		esImage,
+	)
+	out, err := runCmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("start elasticsearch container: %w", err)
+		return fmt.Errorf("docker run %s: %w\n%s", esImage, err, string(out))
 	}
 
-	host, err := container.Host(ctx)
+	if err := waitForES(ctx, esStartupWait); err != nil {
+		exec.Command("docker", "rm", "-f", esName).Run()
+		return fmt.Errorf("elasticsearch not ready at %s: %w", esURL, err)
+	}
+
+	return nil
+}
+
+func reuseIfHealthy(ctx context.Context) bool {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(esURL)
 	if err != nil {
-		return "", fmt.Errorf("get es container host: %w", err)
+		return false
 	}
+	resp.Body.Close()
+	return resp.StatusCode < 500
+}
 
-	mappedPort, err := container.MappedPort(ctx, "9200")
-	if err != nil {
-		return "", fmt.Errorf("get es container mapped port: %w", err)
+func waitForES(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 3 * time.Second}
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(esURL)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode < 500 {
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second):
+		}
 	}
-
-	return fmt.Sprintf("http://%s:%s", host, mappedPort.Port()), nil
+	return fmt.Errorf("timed out after %v", timeout)
 }

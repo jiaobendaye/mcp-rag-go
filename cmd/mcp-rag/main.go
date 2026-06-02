@@ -145,21 +145,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("create splitter: %w", err)
 	}
 
-	// KB indexer (template; per-call index routing via WithIndex)
-	kbIndexer, err := rag.NewKBIndexer(ctx, &elastic_indexer.IndexerConfig{
+	// KB indexer config (used by per-request BuildIndexChain)
+	indexerConf := &elastic_indexer.IndexerConfig{
 		Client:           esClient,
-		Index:            rag.PlaceholderIndex,
 		IndexSpec:        indexSpecForDims(dims),
 		DocumentToFields: rag.ProjectDocumentToFields(),
 		Embedding:        embedder,
-	})
-	if err != nil {
-		return fmt.Errorf("create kb indexer: %w", err)
-	}
-
-	// Ensure default KB's index exists
-	if err := kbIndexer.EnsureIndexForKB(ctx, defaultKB.IndexName()); err != nil {
-		log.Printf("WARNING: ensure default index: %v", err)
 	}
 
 	// KB retriever (template; per-call index routing via WithIndex)
@@ -189,8 +180,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Setup HTTP
 	gin.SetMode(gin.ReleaseMode)
-	srv := server.New(cfg, configManager, metricsCollector, retrievalCache,
-		embedder, splitter, llm, kbIndexer, kbRetriever, esClient, kbService, dims)
+	srv, err := server.New(cfg, configManager, metricsCollector, retrievalCache,
+		embedder, splitter, llm, indexerConf, kbRetriever, esClient, kbService, dims)
+	if err != nil {
+		return fmt.Errorf("create server: %w", err)
+	}
 	router := srv.Setup()
 
 	httpServer := &http.Server{Addr: fmt.Sprintf(":%d", cfg.HTTPPort), Handler: router}

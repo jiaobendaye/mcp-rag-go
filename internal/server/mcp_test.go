@@ -76,7 +76,7 @@ func setupMCPServer(t *testing.T) *gin.Engine {
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
 
-	s := New(cfg, nil, nil, nil, emb, nil, &mcpTestLLM{}, nil, searcher, nil, kbs, 0)
+	s, _ := New(cfg, nil, nil, nil, emb, nil, &mcpTestLLM{}, nil, searcher, nil, kbs, 0)
 	return s.Setup()
 }
 
@@ -97,7 +97,7 @@ func TestMCPRagAskParameterParsing(t *testing.T) {
 	cfg := config.DefaultConfig()
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
-	s := New(cfg, nil, nil, nil, emb, nil, &mcpTestLLM{}, nil, searcher, nil, kbs, 0)
+	s, _ := New(cfg, nil, nil, nil, emb, nil, &mcpTestLLM{}, nil, searcher, nil, kbs, 0)
 
 	// Init MCP server (stores mcpSrv on the Server)
 	s.mcpSrv, s.mcpHandler = s.InitMCP()
@@ -251,7 +251,7 @@ func TestMCPToolsRegistered(t *testing.T) {
 	cfg := config.DefaultConfig()
 	emb := &mcpTestEmbedder{}
 	searcher := &mcpTestSearcher{}
-	s := New(cfg, nil, nil, nil, emb, nil, &mcpTestLLM{}, nil, searcher, nil, kbs, 0)
+	s, _ := New(cfg, nil, nil, nil, emb, nil, &mcpTestLLM{}, nil, searcher, nil, kbs, 0)
 	s.mcpSrv, s.mcpHandler = s.InitMCP()
 
 	tools := s.mcpSrv.ListTools()

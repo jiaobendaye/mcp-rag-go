@@ -42,7 +42,7 @@ func setupIntegrationServer(t *testing.T) (*gin.Engine, *knowledgebase.Service, 
 	ctx := context.Background()
 
 	// ES container via testcontainers (no docker-compose needed).
-	esURL, err := testutil.GetESURL(ctx)
+	esURL, err := testutil.StartES(t, ctx)
 	if err != nil {
 		t.Skipf("SKIP: cannot start ES container: %v", err)
 	}
@@ -137,19 +137,19 @@ func setupIntegrationServer(t *testing.T) (*gin.Engine, *knowledgebase.Service, 
 		t.Fatalf("create splitter: %v", err)
 	}
 
-	// KB indexer
-	kbIndexer, err := rag.NewKBIndexer(ctx, &elastic_indexer.IndexerConfig{
+	// KB indexer config
+	indexerConf := &elastic_indexer.IndexerConfig{
 		Client:           esClient,
-		Index:            rag.PlaceholderIndex,
 		IndexSpec:        indexSpecForDims(dims),
 		DocumentToFields: rag.ProjectDocumentToFields(),
 		Embedding:        embedder,
-	})
-	if err != nil {
-		t.Fatalf("create kb indexer: %v", err)
 	}
-	if err := kbIndexer.EnsureIndexForKB(ctx, defaultKB.IndexName()); err != nil {
-		t.Logf("WARNING: ensure default index: %v", err)
+	{
+		confCopy := *indexerConf
+		confCopy.Index = defaultKB.IndexName()
+		if _, err := elastic_indexer.NewIndexer(ctx, &confCopy); err != nil {
+			t.Logf("WARNING: ensure default index: %v", err)
+		}
 	}
 
 	// KB retriever
@@ -177,7 +177,10 @@ func setupIntegrationServer(t *testing.T) (*gin.Engine, *knowledgebase.Service, 
 	}
 
 	gin.SetMode(gin.TestMode)
-	s := New(cfg, nil, nil, nil, embedder, splitter, llm, kbIndexer, kbRetriever, esClient, kbService, dims)
+	s, err := New(cfg, nil, nil, nil, embedder, splitter, llm, indexerConf, kbRetriever, esClient, kbService, dims)
+	if err != nil {
+		t.Fatalf("create server: %v", err)
+	}
 	return s.Setup(), kbService, esClient
 }
 
@@ -518,7 +521,7 @@ func TestAddDocument_BodyKBID(t *testing.T) {
 // generation end-to-end. If the LLM is unavailable the test is skipped
 // rather than failed (the setup integration server falls back to nil).
 func TestChat_SingleKB(t *testing.T) {
-	r, kbSvc, _ := setupIntegrationServer(t)
+	r, kbSvc, esClient := setupIntegrationServer(t)
 
 	// Seed a KB with content
 	legacyKey := "legacy:public:chat_test"
@@ -534,6 +537,13 @@ func TestChat_SingleKB(t *testing.T) {
 	r.ServeHTTP(w1, req1)
 	if w1.Code != 200 {
 		t.Fatalf("add-document: %d %s", w1.Code, w1.Body.String())
+	}
+
+	// ES near-real-time: force refresh so the newly indexed document is searchable.
+	if refreshResp, err := esClient.Indices.Refresh(esClient.Indices.Refresh.WithIndex("kb_*")); err != nil {
+		t.Logf("refresh warning: %v", err)
+	} else {
+		refreshResp.Body.Close()
 	}
 
 	// Chat about the content

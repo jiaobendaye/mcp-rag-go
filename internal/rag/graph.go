@@ -3,7 +3,9 @@ package rag
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/cloudwego/eino/components/embedding"
 	"github.com/cloudwego/eino/components/prompt"
@@ -14,27 +16,38 @@ import (
 
 // retrievalState holds shared state for the retrieval graph.
 type retrievalState struct {
-	Query  string
-	Vector []float64
+	Query      string
+	Vector     []float64
+	IndexNames []string // per-request KB index names (single KB: []string{idx})
+	TopK       int      // per-request top-K
+	MinScore   float64  // per-request score threshold
+	SearchMode string   // per-request search mode (hybrid/knn/rrf/keyword)
 }
 
-// BuildRetrievalGraphAt returns a compose.Runnable that retrieves from
-// the given ES index and produces an LLM answer. Per-request compile
-// with closure capture of indexName, topK, and minScore via
-// retriever.WithIndex / WithTopK / WithScoreThreshold.
+// BuildRetrievalGraph returns a compose.Runnable that retrieves from
+// one or more KB ES indices and produces an LLM answer. The graph is
+// compiled once at startup; per-request KB parameters (indexNames, topK,
+// minScore, searchMode) are passed via context using WithKBParams, read in
+// parse_input's StatePostHandler, and stored in retrievalState for
+// downstream nodes (build_query, multi_retrieve) to consume.
 //
 // Graph topology:
 //
 //	string (query)
 //	  ↓
 //	[parse_input]         Lambda: write state.Query → passthrough string
-//	                      (also embeds query via embedder, stores in state.Vector)
+//	                      (also embeds query via embedder, stores state.Vector,
+//	                       reads KBParams from context → stores IndexNames/TopK/
+//	                       MinScore/SearchMode in state)
 //	  ↓
-//	[build_query]         Lambda: read state.Vector, build ES JSON body via
-//	                      BuildHybridQueryJSON. Output: JSON body string.
+//	[build_query]         Lambda: read state.Vector/TopK/MinScore/SearchMode,
+//	                      build ES JSON body via BuildHybridQueryJSON.
+//	                      Output: JSON body string.
 //	  ↓
-//	[retrieve]            retriever: string → []*schema.Document
-//	                      (closes over per-request indexName)
+//	[multi_retrieve]      Lambda: read IndexNames/TopK/MinScore from state,
+//	                      fan-out across N ES indices via goroutines,
+//	                      merge results by score desc, truncate to TopK.
+//	                      Output: []*schema.Document
 //	  ↓
 //	[assemble_prompt]     Lambda: docs + state.Query → map[string]any
 //	  ↓
@@ -43,43 +56,21 @@ type retrievalState struct {
 //	[chat_model]          ChatModel: []*schema.Message → *schema.Message
 //	  ↓
 //	[format_output]       Lambda: *schema.Message → string (content)
-//
-// The embedder is required because the eino-ext retriever is configured
-// with SearchModeRawStringRequest, which expects the query arg to be a
-// complete ES query body JSON (NOT plain text). We must build that body
-// ourselves using the embedded query vector and BuildHybridQueryJSON.
-func BuildRetrievalGraphAt(
+func BuildRetrievalGraph(
 	ctx context.Context,
 	kbRetriever retriever.Retriever,
 	llm LLMGenerator,
 	embedder embedding.Embedder,
-	indexName string,
-	searchMode string,
-	topK int,
-	minScore float64,
 ) (compose.Runnable[string, string], error) {
-	if indexName == "" {
-		return nil, fmt.Errorf("BuildRetrievalGraphAt: empty indexName")
-	}
 	if kbRetriever == nil {
-		return nil, fmt.Errorf("BuildRetrievalGraphAt: nil kbRetriever")
+		return nil, fmt.Errorf("BuildRetrievalGraph: nil kbRetriever")
 	}
 	if llm == nil {
-		return nil, fmt.Errorf("BuildRetrievalGraphAt: nil llm")
+		return nil, fmt.Errorf("BuildRetrievalGraph: nil llm")
 	}
 	if embedder == nil {
-		return nil, fmt.Errorf("BuildRetrievalGraphAt: nil embedder (needed to build ES query JSON)")
+		return nil, fmt.Errorf("BuildRetrievalGraph: nil embedder (needed to build ES query JSON)")
 	}
-
-	// Per-request retriever options: close over indexName + the per-request
-	// topK/minScore. The adapter ignores caller-supplied options and uses
-	// these instead, so the retriever always queries the resolved KB.
-	retrieveOpts := []retriever.Option{
-		retriever.WithIndex(indexName),
-		retriever.WithTopK(topK),
-		retriever.WithScoreThreshold(minScore),
-	}
-	frozenRetriever := newRetrieverWithFixedIndex(kbRetriever, retrieveOpts)
 
 	chatTemplate := prompt.FromMessages(schema.FString,
 		schema.SystemMessage("你是一个知识库助手，基于给定的参考资料回答问题。如果知识库内容不足以回答问题，请说明无法找到相关信息。"),
@@ -93,7 +84,8 @@ func BuildRetrievalGraphAt(
 	)
 
 	// Node 1: parse_input — passthrough, record query in state, embed query
-	// to produce dense vector (stored in state for build_query to use).
+	// to produce dense vector, and read per-request KBParams from context
+	// into state for downstream nodes.
 	if err := graph.AddLambdaNode("parse_input", compose.InvokableLambda(
 		func(ctx context.Context, in string) (string, error) {
 			return in, nil
@@ -109,20 +101,35 @@ func BuildRetrievalGraphAt(
 			return "", fmt.Errorf("embedder returned empty vector")
 		}
 		state.Vector = vectors[0]
+		// Read per-request KB params from caller's context.
+		if kb, ok := GetKBParams(ctx); ok {
+			state.IndexNames = kb.IndexNames
+			state.TopK = kb.TopK
+			state.MinScore = kb.MinScore
+			state.SearchMode = kb.SearchMode
+		}
 		return out, nil
 	})); err != nil {
 		return nil, fmt.Errorf("add parse_input node: %w", err)
 	}
 
-	// Node 2: build_query — read state.Vector, build ES query body JSON
-	// via BuildHybridQueryJSON. The output is the JSON body that the
-	// eino-ext retriever (configured with SearchModeRawStringRequest)
-	// expects as its query argument.
+	// Node 2: build_query — read state.Vector, TopK, MinScore, SearchMode
+	// and build ES query body JSON via BuildHybridQueryJSON. The output
+	// is the JSON body that the eino-ext retriever (configured with
+	// SearchModeRawStringRequest) expects as its query argument.
 	if err := graph.AddLambdaNode("build_query", compose.InvokableLambda(
 		func(ctx context.Context, in string) (string, error) {
-			var vector []float64
+			var (
+				vector     []float64
+				topK       int
+				minScore   float64
+				searchMode string
+			)
 			if err := compose.ProcessState[*retrievalState](ctx, func(ctx context.Context, s *retrievalState) error {
 				vector = s.Vector
+				topK = s.TopK
+				minScore = s.MinScore
+				searchMode = s.SearchMode
 				return nil
 			}); err != nil {
 				return "", fmt.Errorf("read state: %w", err)
@@ -140,13 +147,56 @@ func BuildRetrievalGraphAt(
 		return nil, fmt.Errorf("add build_query node: %w", err)
 	}
 
-	// Node 3: retrieve — uses the per-request retriever that closes over
-	// indexName, topK, minScore. Receives the JSON body from build_query.
-	if err := graph.AddRetrieverNode("retrieve", frozenRetriever); err != nil {
-		return nil, fmt.Errorf("add retrieve node: %w", err)
+	// Node 3: multi_retrieve — reads IndexNames/TopK/MinScore from state,
+	// fans out across N KB indices using goroutines, merges results by
+	// score descending, and truncates to TopK.
+	if err := graph.AddLambdaNode("multi_retrieve", compose.InvokableLambda(
+		func(ctx context.Context, body string) ([]*schema.Document, error) {
+			var indexNames []string
+			var topK int
+			var minScore float64
+			if err := compose.ProcessState[*retrievalState](ctx, func(ctx context.Context, s *retrievalState) error {
+				indexNames = s.IndexNames
+				topK = s.TopK
+				minScore = s.MinScore
+				return nil
+			}); err != nil {
+				return nil, fmt.Errorf("read state: %w", err)
+			}
+
+			if len(indexNames) == 0 {
+				return nil, fmt.Errorf("multi_retrieve: no index names in state")
+			}
+
+			// Fan-out across indices concurrently.
+			results := make([][]*schema.Document, len(indexNames))
+			var wg sync.WaitGroup
+			for i, idx := range indexNames {
+				wg.Add(1)
+				go func(i int, idx string) {
+					defer wg.Done()
+					docs, err := kbRetriever.Retrieve(ctx, body,
+						retriever.WithIndex(idx),
+						retriever.WithTopK(topK),
+						retriever.WithScoreThreshold(minScore),
+					)
+					if err != nil {
+						// Log but don't fail — index-level errors are
+						// non-fatal; downstream handles empty results.
+						return
+					}
+					results[i] = docs
+				}(i, idx)
+			}
+			wg.Wait()
+
+			return mergeDocs(results, topK), nil
+		},
+	)); err != nil {
+		return nil, fmt.Errorf("add multi_retrieve node: %w", err)
 	}
 
-	// Node 3: assemble_prompt — docs + state.Query → map[string]any{"query", "context"}
+	// Node 4: assemble_prompt — docs + state.Query → map[string]any{"query", "context"}
 	if err := graph.AddLambdaNode("assemble_prompt", compose.InvokableLambda(
 		func(ctx context.Context, docs []*schema.Document) (map[string]any, error) {
 			var query string
@@ -183,17 +233,17 @@ func BuildRetrievalGraphAt(
 		return nil, fmt.Errorf("add assemble_prompt node: %w", err)
 	}
 
-	// Node 4: chat_template
+	// Node 5: chat_template
 	if err := graph.AddChatTemplateNode("chat_template", chatTemplate); err != nil {
 		return nil, fmt.Errorf("add chat_template node: %w", err)
 	}
 
-	// Node 5: chat_model
+	// Node 6: chat_model
 	if err := graph.AddChatModelNode("chat_model", llm); err != nil {
 		return nil, fmt.Errorf("add chat_model node: %w", err)
 	}
 
-	// Node 6: format_output
+	// Node 7: format_output
 	if err := graph.AddLambdaNode("format_output", compose.InvokableLambda(
 		func(ctx context.Context, msg *schema.Message) (string, error) {
 			return msg.Content, nil
@@ -208,8 +258,8 @@ func BuildRetrievalGraphAt(
 	}{
 		{compose.START, "parse_input"},
 		{"parse_input", "build_query"},
-		{"build_query", "retrieve"},
-		{"retrieve", "assemble_prompt"},
+		{"build_query", "multi_retrieve"},
+		{"multi_retrieve", "assemble_prompt"},
 		{"assemble_prompt", "chat_template"},
 		{"chat_template", "chat_model"},
 		{"chat_model", "format_output"},
@@ -226,4 +276,23 @@ func BuildRetrievalGraphAt(
 		return nil, fmt.Errorf("compile graph: %w", err)
 	}
 	return runnable, nil
+}
+
+// mergeDocs flattens per-index document slices, sorts by score descending,
+// and truncates to topK. It is used by the multi_retrieve lambda to
+// combine results from concurrent per-index retrieval calls.
+func mergeDocs(kbResults [][]*schema.Document, topK int) []*schema.Document {
+	var all []*schema.Document
+	for _, docs := range kbResults {
+		all = append(all, docs...)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		si, _ := all[i].MetaData["score"].(float64)
+		sj, _ := all[j].MetaData["score"].(float64)
+		return si > sj
+	})
+	if topK > 0 && len(all) > topK {
+		all = all[:topK]
+	}
+	return all
 }

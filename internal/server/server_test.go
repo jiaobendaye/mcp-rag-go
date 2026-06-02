@@ -70,7 +70,7 @@ func setupTestServer() *gin.Engine {
 	cfg := config.DefaultConfig()
 	emb := &httpTestEmbedder{}
 	searcher := &testMockSearcher{}
-	s := New(cfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, searcher, nil, nil, 0)
+	s, _ := New(cfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, searcher, nil, nil, 0)
 	return s.Setup()
 }
 
@@ -87,7 +87,7 @@ func setupTestServerWithKB(t *testing.T) (*gin.Engine, *knowledgebase.Service) {
 	}
 	emb := &httpTestEmbedder{}
 	searcher := &testMockSearcher{}
-	s := New(cfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, searcher, nil, svc, 0)
+	s, _ := New(cfg, nil, nil, nil, emb, nil, &mockLLM{}, nil, searcher, nil, svc, 0)
 	return s.Setup(), svc
 }
 

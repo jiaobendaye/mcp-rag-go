@@ -18,12 +18,12 @@ import (
 
 const testDims = 4
 
-func setupIntegrationTest(t *testing.T) (*KBIndexer, *KBRetriever, func()) {
+func setupIntegrationTest(t *testing.T) (*elastic_indexer.IndexerConfig, *KBRetriever, func()) {
 	t.Helper()
 
 	ctx := context.Background()
 
-	esURL, err := testutil.GetESURL(ctx)
+	esURL, err := testutil.StartES(t, ctx)
 	if err != nil {
 		t.Skipf("SKIP: cannot start ES container: %v", err)
 	}
@@ -37,17 +37,17 @@ func setupIntegrationTest(t *testing.T) (*KBIndexer, *KBRetriever, func()) {
 
 	indexName := "test_kb_integration"
 
-	indexer, err := NewKBIndexer(context.Background(), &elastic_indexer.IndexerConfig{
+	conf := &elastic_indexer.IndexerConfig{
 		Client:           esClient,
-		Index:            indexName,
 		IndexSpec:        indexSpecForTestDims(testDims),
 		DocumentToFields: ProjectDocumentToFields(),
-	})
-	if err != nil {
-		t.Fatalf("create indexer: %v", err)
 	}
-	if err := indexer.EnsureIndexForKB(context.Background(), indexName); err != nil {
-		t.Fatalf("ensure index: %v", err)
+	{
+		confCopy := *conf
+		confCopy.Index = indexName
+		if _, err := elastic_indexer.NewIndexer(context.Background(), &confCopy); err != nil {
+			t.Fatalf("ensure index: %v", err)
+		}
 	}
 
 	retriever, err := NewKBRetriever(context.Background(), &elastic_retriever.RetrieverConfig{
@@ -65,7 +65,7 @@ func setupIntegrationTest(t *testing.T) (*KBIndexer, *KBRetriever, func()) {
 		esClient.Indices.Delete([]string{indexName})
 	}
 
-	return indexer, retriever, cleanup
+	return conf, retriever, cleanup
 }
 
 func indexSpecForTestDims(dims int) *elastic_indexer.IndexSpec {
@@ -105,7 +105,7 @@ func TestIntegrationIndexAndSearch(t *testing.T) {
 func TestIntegrationSearchEmptyIndex(t *testing.T) {
 	ctx := context.Background()
 
-	esURL, err := testutil.GetESURL(ctx)
+	esURL, err := testutil.StartES(t, ctx)
 	if err != nil {
 		t.Skipf("SKIP: cannot start ES container: %v", err)
 	}
@@ -119,17 +119,17 @@ func TestIntegrationSearchEmptyIndex(t *testing.T) {
 
 	indexName := "test_empty_integration"
 
-	indexer, err := NewKBIndexer(ctx, &elastic_indexer.IndexerConfig{
+	conf := &elastic_indexer.IndexerConfig{
 		Client:           esClient,
-		Index:            indexName,
 		IndexSpec:        indexSpecForTestDims(testDims),
 		DocumentToFields: ProjectDocumentToFields(),
-	})
-	if err != nil {
-		t.Fatalf("create indexer: %v", err)
 	}
-	if err := indexer.EnsureIndexForKB(ctx, indexName); err != nil {
-		t.Fatalf("ensure index: %v", err)
+	{
+		confCopy := *conf
+		confCopy.Index = indexName
+		if _, err := elastic_indexer.NewIndexer(ctx, &confCopy); err != nil {
+			t.Fatalf("ensure index: %v", err)
+		}
 	}
 	defer esClient.Indices.Delete([]string{indexName})
 

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -15,9 +14,12 @@ import (
 
 	"github.com/cloudwego/eino/components/document"
 	"github.com/cloudwego/eino/components/retriever"
+	"github.com/cloudwego/eino/compose"
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/gin-gonic/gin"
 	mcpserver "github.com/mark3labs/mcp-go/server"
+
+	elastic_indexer "github.com/cloudwego/eino-ext/components/indexer/es8"
 
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
@@ -37,8 +39,12 @@ type Server struct {
 	splitter    document.Transformer
 	embedder    rag.Embedder
 	llm         rag.LLMGenerator
-	kbIndexer   *rag.KBIndexer
+	indexerConf *elastic_indexer.IndexerConfig
 	kbRetriever retriever.Retriever
+
+	// Pre-compiled graph (compiled once at startup, reused across all
+	// requests with KB params injected via context).
+	preCompiledGraph compose.Runnable[string, string]
 
 	// Direct ES client for admin endpoints
 	esClient *elasticsearch.Client
@@ -53,7 +59,10 @@ type Server struct {
 	mcpHandler *mcpserver.StreamableHTTPServer
 }
 
-// New creates a new Server with all dependencies.
+// New creates a new Server with all dependencies and pre-compiles the
+// retrieval graph and index chain when all required components are
+// available. Returns an error only if compilation of available components
+// fails (nil components skip compilation gracefully — useful for tests).
 func New(
 	cfg *config.Config,
 	configManager *config.ConfigManager,
@@ -62,12 +71,24 @@ func New(
 	embedder rag.Embedder,
 	splitter document.Transformer,
 	llm rag.LLMGenerator,
-	kbIndexer *rag.KBIndexer,
+	indexerConf *elastic_indexer.IndexerConfig,
 	kbRetriever retriever.Retriever,
 	esClient *elasticsearch.Client,
 	kbs *knowledgebase.Service,
 	embedDims int,
-) *Server {
+) (*Server, error) {
+	// Pre-compile the retrieval graph when all required components are
+	// available (nil components skip compilation — tests may pass nil).
+	var preCompiledGraph compose.Runnable[string, string]
+
+	if kbRetriever != nil && llm != nil && embedder != nil {
+		var err error
+		preCompiledGraph, err = rag.BuildRetrievalGraph(context.Background(), kbRetriever, llm, embedder)
+		if err != nil {
+			return nil, fmt.Errorf("pre-compile retrieval graph: %w", err)
+		}
+	}
+
 	return &Server{
 		cfg:              cfg,
 		configManager:    configManager,
@@ -76,13 +97,14 @@ func New(
 		embedder:         embedder,
 		splitter:         splitter,
 		llm:              llm,
-		kbIndexer:        kbIndexer,
+		indexerConf: indexerConf,
 		kbRetriever:      kbRetriever,
 		esClient:         esClient,
 		kbs:              kbs,
 		embedDims:        embedDims,
 		classifier:       rag.NewQueryClassifier(),
-	}
+		preCompiledGraph:  preCompiledGraph,
+	}, nil
 }
 
 // Setup registers all routes on the Gin engine.
@@ -254,7 +276,7 @@ func (s *Server) health(c *gin.Context) {
 	}
 
 	// Determine readiness
-	bootstrapped := s.embedder != nil && s.kbIndexer != nil && s.kbs != nil
+	bootstrapped := s.embedder != nil && s.indexerConf != nil && s.kbs != nil
 	ready := bootstrapped
 	if ready && s.esClient != nil {
 		res, err := s.esClient.Ping()
@@ -315,7 +337,7 @@ func (s *Server) buildRuntimeSnapshot() gin.H {
 	}
 
 	// document_processor
-	if s.kbIndexer != nil {
+	if s.indexerConf != nil {
 		runtime["document_processor"] = "ready"
 	} else {
 		runtime["document_processor"] = nil
@@ -363,7 +385,7 @@ func (s *Server) ready(c *gin.Context) {
 		revision = s.configManager.Revision()
 	}
 
-	bootstrapped := s.embedder != nil && s.kbIndexer != nil && s.kbs != nil
+	bootstrapped := s.embedder != nil && s.indexerConf != nil && s.kbs != nil
 	ready := bootstrapped
 	reasons := []string{}
 	if !bootstrapped {
@@ -789,14 +811,6 @@ func (s *Server) createKnowledgeBase(c *gin.Context) {
 		return
 	}
 
-	// Ensure ES index for the new KB (non-fatal on failure)
-	if s.kbIndexer != nil {
-		indexName := kb.IndexName()
-		if err := s.kbIndexer.EnsureIndexForKB(c.Request.Context(), indexName); err != nil {
-			log.Printf("WARNING: Failed to create ES index %s for KB %d: %v", indexName, kb.ID, err)
-		}
-	}
-
 	c.JSON(http.StatusOK, kb)
 }
 
@@ -815,10 +829,8 @@ func (s *Server) listCollections(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"collections": names})
 }
 
-// addDocument writes a document to the resolved KB's index. Per-request
-// BuildIndexChainAt compile captures indexName in a closure; the underlying
-// KBIndexer.Store is invoked with WithIndex(indexName) so chunks land in
-// the right ES index.
+// addDocument writes a document to the resolved KB's index. The index
+// chain is built per-request with the concrete ES index name.
 func (s *Server) addDocument(c *gin.Context) {
 	var req struct {
 		Content string `json:"content"`
@@ -841,7 +853,7 @@ func (s *Server) addDocument(c *gin.Context) {
 		return
 	}
 
-	if s.kbIndexer == nil || s.splitter == nil {
+	if s.indexerConf == nil || s.splitter == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "indexer not configured"})
 		return
 	}
@@ -869,13 +881,13 @@ func (s *Server) addDocument(c *gin.Context) {
 	}
 	tmpFile.Close()
 
-	// Per-request compile + invoke
-	runnable, err := rag.BuildIndexChainAt(c.Request.Context(), s.splitter, s.kbIndexer, indexName)
+	// Per-request index chain: build with concrete indexName, no KBParams.
+	chain, err := rag.BuildIndexChain(c.Request.Context(), s.splitter, s.indexerConf, indexName)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": fmt.Sprintf("build chain: %v", err)})
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
-	ids, err := runnable.Invoke(c.Request.Context(), document.Source{URI: tmpPath})
+	ids, err := chain.Invoke(c.Request.Context(), document.Source{URI: tmpPath})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -898,9 +910,8 @@ func (s *Server) addDocument(c *gin.Context) {
 	})
 }
 
-// uploadFiles handles multipart file upload and indexing. Each file is
-// indexed via a per-request BuildIndexChainAt compile that closes over
-// the resolved indexName.
+// uploadFiles handles multipart file upload and indexing. All files in
+// the batch share the same KB, so the index chain is built once.
 func (s *Server) uploadFiles(c *gin.Context) {
 	form, err := c.MultipartForm()
 	if err != nil {
@@ -936,8 +947,16 @@ func (s *Server) uploadFiles(c *gin.Context) {
 		return
 	}
 
-	if s.kbIndexer == nil || s.splitter == nil {
+	if s.indexerConf == nil || s.splitter == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "indexer not configured"})
+		return
+	}
+
+	// Build the index chain once for this KB (all files share the same
+	// index; compile overhead ~12µs is negligible vs file I/O + ES writes).
+	chain, err := rag.BuildIndexChain(c.Request.Context(), s.splitter, s.indexerConf, indexName)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
 
@@ -963,14 +982,7 @@ func (s *Server) uploadFiles(c *gin.Context) {
 			continue
 		}
 
-		// Per-request compile + invoke
-		runnable, err := rag.BuildIndexChainAt(c.Request.Context(), s.splitter, s.kbIndexer, indexName)
-		if err != nil {
-			os.Remove(tmpPath)
-			results = append(results, fileResult{Filename: fh.Filename, ContentLength: fh.Size, Error: err.Error()})
-			continue
-		}
-		_, err = runnable.Invoke(c.Request.Context(), document.Source{URI: tmpPath})
+		_, err = chain.Invoke(c.Request.Context(), document.Source{URI: tmpPath})
 		os.Remove(tmpPath)
 		if err != nil {
 			results = append(results, fileResult{Filename: fh.Filename, ContentLength: fh.Size, Error: err.Error()})
@@ -1363,12 +1375,17 @@ func (s *Server) chat(c *gin.Context) {
 		limit = s.cfg.TopK
 	}
 
-	runnable, err := rag.BuildRetrievalGraphAt(c.Request.Context(), s.kbRetriever, s.llm, s.embedder, indexName, s.cfg.SearchMode, limit, s.cfg.MinScore)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": fmt.Sprintf("build graph: %v", err)})
+	ctx := rag.WithKBParams(c.Request.Context(), rag.KBParams{
+		IndexNames: []string{indexName},
+		TopK:       limit,
+		MinScore:   s.cfg.MinScore,
+		SearchMode: s.cfg.SearchMode,
+	})
+	if s.preCompiledGraph == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "retrieval graph not compiled (missing components)"})
 		return
 	}
-	answer, err := runnable.Invoke(c.Request.Context(), req.Query)
+	answer, err := s.preCompiledGraph.Invoke(ctx, req.Query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -1382,96 +1399,56 @@ func (s *Server) chat(c *gin.Context) {
 	})
 }
 
-// chatMultiKB runs per-KB BuildRetrievalGraphAt compiles in parallel
-// goroutines. Each goroutine produces an answer for its own ES index;
-// answers are concatenated and a final LLM call combines them.
+// chatMultiKB resolves multiple KBs and invokes the pre-compiled graph
+// once with all index names. The graph's multi_retrieve node fans out
+// across all KB indices concurrently, merges results, and the LLM produces
+// a single answer covering all knowledge bases.
 func (s *Server) chatMultiKB(c *gin.Context, req *rag.ChatRequest) {
 	limit := req.Limit
 	if limit <= 0 {
 		limit = s.cfg.TopK
 	}
 
-	type kbInfo struct {
-		kb        *knowledgebase.KnowledgeBase
-		indexName string
-	}
 	seen := map[string]bool{}
-	var kbs []kbInfo
+	var indexNames []string
 	for _, id := range req.KBIDs {
 		resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{KBID: &id})
 		if err != nil {
 			continue
 		}
-		indexName := resolution.KnowledgeBase.IndexName()
-		if seen[indexName] {
+		idx := resolution.KnowledgeBase.IndexName()
+		if seen[idx] {
 			continue
 		}
-		seen[indexName] = true
-		kbs = append(kbs, kbInfo{resolution.KnowledgeBase, indexName})
+		seen[idx] = true
+		indexNames = append(indexNames, idx)
 	}
 
-	if len(kbs) == 0 {
+	if len(indexNames) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "no valid knowledge bases found"})
 		return
 	}
 
-	type chatResult struct {
-		kbName string
-		answer string
-		err    error
+	ctx := rag.WithKBParams(c.Request.Context(), rag.KBParams{
+		IndexNames: indexNames,
+		TopK:       limit,
+		MinScore:   s.cfg.MinScore,
+		SearchMode: s.cfg.SearchMode,
+	})
+	if s.preCompiledGraph == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "retrieval graph not compiled (missing components)"})
+		return
 	}
-	results := make([]chatResult, len(kbs))
-	var wg sync.WaitGroup
-	for i, kb := range kbs {
-		wg.Add(1)
-		go func(idx int, info kbInfo) {
-			defer wg.Done()
-			runnable, err := rag.BuildRetrievalGraphAt(c.Request.Context(), s.kbRetriever, s.llm, s.embedder, info.indexName, s.cfg.SearchMode, limit, s.cfg.MinScore)
-			if err != nil {
-				results[idx] = chatResult{kbName: info.kb.Name, err: err}
-				return
-			}
-			answer, err := runnable.Invoke(c.Request.Context(), req.Query)
-			results[idx] = chatResult{kbName: info.kb.Name, answer: answer, err: err}
-		}(i, kb)
-	}
-	wg.Wait()
-
-	// Combine per-KB answers via a final LLM call (or join if LLM unavailable)
-	var b strings.Builder
-	collected := 0
-	for _, r := range results {
-		if r.err != nil || r.answer == "" {
-			continue
-		}
-		if collected > 0 {
-			b.WriteString("\n\n")
-		}
-		fmt.Fprintf(&b, "## %s\n\n%s", r.kbName, r.answer)
-		collected++
-	}
-
-	var finalAnswer string
-	if collected == 0 {
-		finalAnswer = "未找到相关信息。"
-	} else if collected == 1 {
-		finalAnswer = b.String()
-	} else {
-		// Use LLM to combine
-		combined, err := s.llm.Generate(c.Request.Context(), []*rag.EinoMessage{
-			{Role: "user", Content: fmt.Sprintf("基于以下多知识库答案，给出一个综合回答：\n\n%s", b.String())},
-		})
-		if err != nil || combined == nil {
-			finalAnswer = b.String()
-		} else {
-			finalAnswer = combined.Content
-		}
+	answer, err := s.preCompiledGraph.Invoke(ctx, req.Query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"query":      req.Query,
 		"collection": "multi_kb",
-		"response":   finalAnswer,
+		"response":   answer,
 		"sources":    []any{},
 	})
 }

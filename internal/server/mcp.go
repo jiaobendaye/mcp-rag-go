@@ -210,14 +210,16 @@ func (s *Server) handleRawMode(ctx context.Context, query string, limit int, thr
 	return mcp.NewToolResultText(sb.String()), nil
 }
 
-// handleSummaryMode uses the per-request BuildRetrievalGraphAt to
-// retrieve + LLM summary.
+// handleSummaryMode uses the pre-compiled retrieval graph to
+// retrieve + LLM summary. KB params are injected via context.
 func (s *Server) handleSummaryMode(ctx context.Context, query string, limit int, threshold float64, indexName string) (*mcp.CallToolResult, error) {
-	runnable, err := rag.BuildRetrievalGraphAt(ctx, s.kbRetriever, s.llm, s.embedder, indexName, s.cfg.SearchMode, limit, threshold)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("构造检索图失败: %v", err)), nil
-	}
-	answer, err := runnable.Invoke(ctx, query)
+	ctx = rag.WithKBParams(ctx, rag.KBParams{
+		IndexNames: []string{indexName},
+		TopK:       limit,
+		MinScore:   threshold,
+		SearchMode: s.cfg.SearchMode,
+	})
+	answer, err := s.preCompiledGraph.Invoke(ctx, query)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
 	}
@@ -334,9 +336,9 @@ func mcpExtractKBIDs(raw any) []int64 {
 	return nil
 }
 
-// handleRagAskMultiKB performs multi-KB retrieval for MCP rag_ask. Per
-// goroutine: build a per-request BuildRetrievalGraphAt compile, invoke
-// it, get the answer. Aggregate by joining answers per KB.
+// handleRagAskMultiKB performs multi-KB retrieval for MCP rag_ask.
+// For summary mode, a single graph Invoke fans out across all KBs.
+// For raw mode, per-KB retrieveAt calls are made in parallel.
 func (s *Server) handleRagAskMultiKB(ctx context.Context, query string, mode string, kbIDs []int64, limit int, threshold float64) (*mcp.CallToolResult, error) {
 	type kbInfo struct {
 		kb        *knowledgebase.KnowledgeBase
@@ -361,6 +363,29 @@ func (s *Server) handleRagAskMultiKB(ctx context.Context, query string, mode str
 		return mcp.NewToolResultError("no valid knowledge bases found"), nil
 	}
 
+	if mode == "summary" {
+		indexNames := make([]string, len(kbs))
+		for i, kb := range kbs {
+			indexNames[i] = kb.indexName
+		}
+		kbCtx := rag.WithKBParams(ctx, rag.KBParams{
+			IndexNames: indexNames,
+			TopK:       limit,
+			MinScore:   threshold,
+			SearchMode: s.cfg.SearchMode,
+		})
+		answer, err := s.preCompiledGraph.Invoke(kbCtx, query)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("查询: %s\n", query))
+		sb.WriteString(fmt.Sprintf("模式: 跨%d个知识库总结\n\n", len(kbIDs)))
+		sb.WriteString(answer)
+		return mcp.NewToolResultText(sb.String()), nil
+	}
+
+	// raw mode: per-KB retrieveAt calls in parallel
 	type result struct {
 		kbName string
 		docs   []*rag.RetrievedDoc
@@ -368,58 +393,19 @@ func (s *Server) handleRagAskMultiKB(ctx context.Context, query string, mode str
 	}
 	results := make([]result, len(kbs))
 
-	// For raw mode: per-KB Retrieve; for summary mode: per-KB BuildRetrievalGraphAt
-	if mode == "summary" {
-		var wg sync.WaitGroup
-		for i, kb := range kbs {
-			wg.Add(1)
-			go func(idx int, info kbInfo) {
-				defer wg.Done()
-				runnable, err := rag.BuildRetrievalGraphAt(ctx, s.kbRetriever, s.llm, s.embedder, info.indexName, s.cfg.SearchMode, limit, threshold)
-				if err != nil {
-					results[idx] = result{kbName: info.kb.Name, err: err}
-					return
-				}
-				answer, err := runnable.Invoke(ctx, query)
-				if err != nil {
-					results[idx] = result{kbName: info.kb.Name, err: err}
-					return
-				}
-				// Wrap answer as a single "doc" for the aggregator
-				results[idx] = result{kbName: info.kb.Name, docs: []*rag.RetrievedDoc{{Content: answer, MetaData: map[string]any{"_answer_only": true}}}}
-			}(i, kb)
-		}
-		wg.Wait()
-	} else {
-		var wg sync.WaitGroup
-		for i, kb := range kbs {
-			wg.Add(1)
-			go func(idx int, info kbInfo) {
-				defer wg.Done()
-				docs, err := s.retrieveAt(ctx, s.kbRetriever, info.indexName, query, limit, threshold, s.cfg.SearchMode)
-				results[idx] = result{kbName: info.kb.Name, docs: docs, err: err}
-			}(i, kb)
-		}
-		wg.Wait()
+	var wg sync.WaitGroup
+	for i, kb := range kbs {
+		wg.Add(1)
+		go func(idx int, info kbInfo) {
+			defer wg.Done()
+			docs, err := s.retrieveAt(ctx, s.kbRetriever, info.indexName, query, limit, threshold, s.cfg.SearchMode)
+			results[idx] = result{kbName: info.kb.Name, docs: docs, err: err}
+		}(i, kb)
 	}
+	wg.Wait()
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("查询: %s\n", query))
-	if mode == "summary" {
-		sb.WriteString(fmt.Sprintf("模式: 跨%d个知识库总结\n\n", len(kbIDs)))
-		for _, r := range results {
-			if r.err != nil {
-				continue
-			}
-			if len(r.docs) == 0 {
-				continue
-			}
-			fmt.Fprintf(&sb, "## %s\n\n%s\n\n", r.kbName, r.docs[0].Content)
-		}
-		return mcp.NewToolResultText(sb.String()), nil
-	}
-
-	// raw mode: list all hits
 	totalHits := 0
 	for _, r := range results {
 		if r.err == nil {

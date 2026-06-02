@@ -6,61 +6,58 @@ import (
 
 	"github.com/cloudwego/eino/components/document"
 	"github.com/cloudwego/eino/compose"
-	"github.com/cloudwego/eino/schema"
 
 	"github.com/cloudwego/eino-ext/components/document/loader/file"
+	elastic_indexer "github.com/cloudwego/eino-ext/components/indexer/es8"
 )
 
-// BuildIndexChainAt returns a compose.Runnable that writes the indexed
-// chunks to the given ES index. Per-request compile: each call rebuilds
-// a fresh chain with a `writeAt` lambda that closes over indexName, so
-// the KBIndexer.Store call inside the lambda receives WithIndex(indexName).
+// BuildIndexChain returns a compose.Runnable that loads a file, splits it
+// into chunks, and indexes them into the named ES index. The chain is built
+// per-request because indexing is infrequent; the compile overhead (~12µs)
+// is negligible compared to file I/O, splitting, embedding, and ES writes.
 //
 // The chain topology is:
 //
-//	Source → FileLoader → RecursiveSplitter → Lambda(writeAt)
+//	Source → FileLoader → RecursiveSplitter → AppendIndexer(idx)
 //
-// The eino-ext KBIndexer handles embedding internally — DocumentToFields
+// The eino-ext Indexer handles embedding internally — DocumentToFields
 // returns EmbedKey: "content_vector" on the content field, so eino-ext's
-// bulkAdd calls Embedding.EmbedStrings for us. We don't need an explicit
-// embed lambda in the chain.
-//
-// Per-request Compile cost is sub-ms for a 3-node linear graph.
-func BuildIndexChainAt(
+// bulkAdd calls Embedding.EmbedStrings for us.
+func BuildIndexChain(
 	ctx context.Context,
 	splitter document.Transformer,
-	kbIndexer *KBIndexer,
+	indexerConf *elastic_indexer.IndexerConfig,
 	indexName string,
 ) (compose.Runnable[document.Source, []string], error) {
-	if indexName == "" {
-		return nil, fmt.Errorf("BuildIndexChainAt: empty indexName")
-	}
-	if kbIndexer == nil {
-		return nil, fmt.Errorf("BuildIndexChainAt: nil kbIndexer")
+	if indexerConf == nil {
+		return nil, fmt.Errorf("BuildIndexChain: nil indexerConf")
 	}
 	if splitter == nil {
-		return nil, fmt.Errorf("BuildIndexChainAt: nil splitter")
+		return nil, fmt.Errorf("BuildIndexChain: nil splitter")
+	}
+
+	// Create a fresh eino-ext indexer for the target index.
+	confCopy := *indexerConf
+	confCopy.Index = indexName
+	idx, err := elastic_indexer.NewIndexer(ctx, &confCopy)
+	if err != nil {
+		return nil, fmt.Errorf("BuildIndexChain: create indexer for %q: %w", indexName, err)
 	}
 
 	loader, err := file.NewFileLoader(ctx, &file.FileLoaderConfig{})
 	if err != nil {
-		return nil, fmt.Errorf("BuildIndexChainAt: create loader: %w", err)
+		return nil, fmt.Errorf("BuildIndexChain: create loader: %w", err)
 	}
-
-	// Lambda closes over indexName — the per-request state.
-	writeAt := compose.InvokableLambda(func(ctx context.Context, docs []*schema.Document) ([]string, error) {
-		return kbIndexer.Store(ctx, docs, WithIndex(indexName))
-	})
 
 	chain := compose.NewChain[document.Source, []string]()
 	chain.
 		AppendLoader(loader).
 		AppendDocumentTransformer(splitter).
-		AppendLambda(writeAt)
+		AppendIndexer(idx)
 
 	runnable, err := chain.Compile(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("BuildIndexChainAt: compile: %w", err)
+		return nil, fmt.Errorf("BuildIndexChain: compile: %w", err)
 	}
 	return runnable, nil
 }
