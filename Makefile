@@ -109,10 +109,8 @@ cover: ## 跑单元测试并产出 HTML coverage
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
 
-test-integration: ## 跑集成测试(需要 ES)
-	docker-compose up -d elasticsearch
-	go test ./... -tags=integration -v -count=1 || true
-	docker-compose down
+test-integration: ## 跑集成测试(自动启动临时 ES 容器)
+	go test ./... -tags=integration -v -count=1
 
 lint: ## 跑 golangci-lint
 	golangci-lint run ./...

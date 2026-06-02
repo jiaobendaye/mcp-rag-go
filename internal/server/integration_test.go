@@ -30,19 +30,27 @@ import (
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
 	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
+	"github.com/jiaobendaye/mcp-rag-go/internal/testutil"
 )
 
-func setupIntegrationServer(t *testing.T) (*gin.Engine, *knowledgebase.Service) {
+func setupIntegrationServer(t *testing.T) (*gin.Engine, *knowledgebase.Service, *elasticsearch.Client) {
 	t.Helper()
 
 	// Load .env so LLM API key is available (same pattern as Makefile serve target).
 	loadDotEnv(t)
 
-	cfg := config.DefaultConfig()
-	cfg.KnowledgeBaseDBPath = filepath.Join(t.TempDir(), "test_kb.db")
-	if url := os.Getenv("MCP_RAG_ES_URL"); url != "" {
-		cfg.ESUrl = url
+	ctx := context.Background()
+
+	// ES container via testcontainers (no docker-compose needed).
+	esURL, err := testutil.GetESURL(ctx)
+	if err != nil {
+		t.Skipf("SKIP: cannot start ES container: %v", err)
 	}
+
+	cfg := config.DefaultConfig()
+	cfg.MinScore = 0.01 // low threshold for integration tests (mxbai-embed-large may have lower scores for Chinese)
+	cfg.KnowledgeBaseDBPath = filepath.Join(t.TempDir(), "test_kb.db")
+	cfg.ESUrl = esURL
 	cfg.EmbeddingProvider = "ollama"
 	cfg.EmbeddingModel = "mxbai-embed-large"
 	cfg.EmbeddingBaseURL = "http://localhost:11434/v1"
@@ -51,24 +59,49 @@ func setupIntegrationServer(t *testing.T) (*gin.Engine, *knowledgebase.Service) 
 	cfg.LLMModel = firstNonEmpty(os.Getenv("MCP_RAG_LLM_MODEL"), "deepseek-v4-flash")
 	cfg.LLMBaseURL = firstNonEmpty(os.Getenv("MCP_RAG_LLM_BASE_URL"), "https://zhi8.xf.bj.cn/onehub/v1")
 
-	ctx := context.Background()
-
 	// ── Probe external services ──────────────────────────────────────
-	// Integration tests need ES + Ollama embedding. If either is missing
-	// we skip all tests with a clear reason (don't FATAL — CI may not
-	// have these services).
+	// Integration tests need Ollama embedding. If missing we skip all
+	// tests with a clear reason. ES is handled by testcontainers above.
 
-	missing := probeServices(t, cfg.ESUrl, cfg.EmbeddingBaseURL, cfg.EmbeddingModel)
+	missing := probeOllama(t, cfg.EmbeddingBaseURL, cfg.EmbeddingModel)
 	if len(missing) > 0 {
 		t.Skipf("SKIP: integration env incomplete — missing: %s\n"+
-			"  To run: ensure ES (%s) and Ollama (%s, model=%s) are up.",
-			strings.Join(missing, ", "), cfg.ESUrl, cfg.EmbeddingBaseURL, cfg.EmbeddingModel)
+			"  To run: ensure Ollama (%s, model=%s) is up.",
+			strings.Join(missing, ", "), cfg.EmbeddingBaseURL, cfg.EmbeddingModel)
 	}
 
 	// ES client (only reach this line if ES is confirmed reachable)
 	esClient, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{cfg.ESUrl}})
 	if err != nil {
 		t.Fatalf("create es client: %v", err)
+	}
+
+	// Clean ES indices from previous test runs to prevent cross-test
+	// pollution (tests share an ES cluster but have independent SQLite DBs).
+	//
+	// ES may reject wildcard DELETE (action.destructive_requires_name=true),
+	// so we list kb_* indices first, then delete each one by name.
+	catResp, err := esClient.Cat.Indices(
+		esClient.Cat.Indices.WithIndex("kb_*"),
+		esClient.Cat.Indices.WithFormat("json"),
+	)
+	if err == nil {
+		var catEntries []struct{ Index string }
+		if err := json.NewDecoder(catResp.Body).Decode(&catEntries); err == nil {
+			for _, entry := range catEntries {
+				if entry.Index != "" {
+					delResp, dErr := esClient.Indices.Delete([]string{entry.Index})
+					if dErr == nil {
+						delResp.Body.Close()
+						t.Logf("ES cleanup: deleted index %s (status=%d)", entry.Index, delResp.StatusCode)
+					}
+				}
+			}
+		}
+		catResp.Body.Close()
+	}
+	if err != nil {
+		t.Logf("ES cleanup: could not list indices: %v", err)
 	}
 
 	// KB service
@@ -145,7 +178,7 @@ func setupIntegrationServer(t *testing.T) (*gin.Engine, *knowledgebase.Service) 
 
 	gin.SetMode(gin.TestMode)
 	s := New(cfg, nil, nil, nil, embedder, splitter, llm, kbIndexer, kbRetriever, esClient, kbService, dims)
-	return s.Setup(), kbService
+	return s.Setup(), kbService, esClient
 }
 
 // indexSpecForDims mirrors main.go's indexSpecForDims; integration tests
@@ -184,7 +217,7 @@ func newSplitter(ctx context.Context, chunkSize, overlap int) (document.Transfor
 }
 
 func TestIntegrationAddDocumentAndSearch(t *testing.T) {
-	r, _ := setupIntegrationServer(t)
+	r, _, _ := setupIntegrationServer(t)
 
 	// Add document
 	body := `{"content":"Go语言是一种静态类型的编译型编程语言，由Google开发，以简洁高效著称。"}`
@@ -214,7 +247,7 @@ func TestIntegrationAddDocumentAndSearch(t *testing.T) {
 }
 
 func TestIntegrationUploadFile(t *testing.T) {
-	r, _ := setupIntegrationServer(t)
+	r, _, _ := setupIntegrationServer(t)
 
 	tmpFile := t.TempDir() + "/test.md"
 	content := "# Test\n\nElasticsearch集成测试文档。"
@@ -250,7 +283,7 @@ func TestIntegrationUploadFile(t *testing.T) {
 // regression test for the 2026-06-01 bug where addDocument ignored
 // kb_id and wrote everything to the default index.
 func TestAddDocument_RoutesToResolvedKB(t *testing.T) {
-	r, kbSvc := setupIntegrationServer(t)
+	r, kbSvc, _ := setupIntegrationServer(t)
 
 	bodyA := `{"content":"Go语言是由Google开发的静态类型编译型语言。"}`
 	bodyB := `{"content":"React和TypeScript是构建现代前端应用的主流技术。"}`
@@ -317,7 +350,7 @@ func TestAddDocument_RoutesToResolvedKB(t *testing.T) {
 // indexName). This is the regression test for the Phase 10 multi-KB
 // read bug where the handler queried the default index for all KBs.
 func TestSearchMultiKB_RealSearch(t *testing.T) {
-	r, kbSvc := setupIntegrationServer(t)
+	r, kbSvc, esClient := setupIntegrationServer(t)
 
 	// Seed two additional KBs with distinct content
 	legacyKey1 := "legacy:public:multi1"
@@ -331,7 +364,7 @@ func TestSearchMultiKB_RealSearch(t *testing.T) {
 		t.Fatalf("create kb2: %v", err)
 	}
 
-	// Add Go content to kb1
+	// Add container content to kb1
 	wA := httptest.NewRecorder()
 	reqA, _ := http.NewRequest("POST", "/add-document?kb_id="+i64toa(kb1.ID), strings.NewReader(`{"content":"Kubernetes容器编排系统管理容器化应用。"}`))
 	reqA.Header.Set("Content-Type", "application/json")
@@ -340,13 +373,45 @@ func TestSearchMultiKB_RealSearch(t *testing.T) {
 		t.Fatalf("add to kb1: %d %s", wA.Code, wA.Body.String())
 	}
 
-	// Add TS content to kb2
+	// Add container content to kb2 so both KBs match "容器"
 	wB := httptest.NewRecorder()
-	reqB, _ := http.NewRequest("POST", "/add-document?kb_id="+i64toa(kb2.ID), strings.NewReader(`{"content":"TailwindCSS是实用优先的CSS框架。"}`))
+	reqB, _ := http.NewRequest("POST", "/add-document?kb_id="+i64toa(kb2.ID), strings.NewReader(`{"content":"Docker Compose用于管理多容器应用。"}`))
 	reqB.Header.Set("Content-Type", "application/json")
 	r.ServeHTTP(wB, reqB)
 	if wB.Code != 200 {
 		t.Fatalf("add to kb2: %d %s", wB.Code, wB.Body.String())
+	}
+
+	// ES near-real-time: force refresh so newly-indexed docs are searchable
+	if refreshResp, err := esClient.Indices.Refresh(esClient.Indices.Refresh.WithIndex("kb_*")); err != nil {
+		t.Logf("refresh warning: %v", err)
+	} else {
+		refreshResp.Body.Close()
+		t.Logf("refresh kb_*: status=%d", refreshResp.StatusCode)
+	}
+	time.Sleep(1 * time.Second)
+
+	// Verify each KB is searchable via single-KB search first
+	for _, tc := range []struct {
+		kbID    int64
+		wantStr string
+		label   string
+	}{
+		{kb1.ID, "Kubernetes", "kb1(multi1)"},
+		{kb2.ID, "Docker", "kb2(multi2)"},
+	} {
+		url := fmt.Sprintf("/search?query=容器&kb_id=%d&limit=5", tc.kbID)
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest("GET", url, nil)
+		r.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Errorf("%s single-kb search: HTTP %d body=%s", tc.label, w.Code, w.Body.String())
+			continue
+		}
+		if !strings.Contains(w.Body.String(), tc.wantStr) {
+			t.Errorf("%s single-kb search should contain %q, got: %s", tc.label, tc.wantStr, w.Body.String())
+		}
+		t.Logf("%s single-kb search OK (contains %q)", tc.label, tc.wantStr)
 	}
 
 	// Search both KBs together
@@ -360,10 +425,6 @@ func TestSearchMultiKB_RealSearch(t *testing.T) {
 	resp := w.Body.String()
 	t.Logf("multi-kb search response: %s", resp)
 
-	// Response should reflect both KBs (we don't assert exact content
-	// matching because embeddings may be approximate; we do assert
-	// that the collection is reported as multi_kb and the metadata
-	// references both KBs).
 	if !strings.Contains(resp, "multi_kb") {
 		t.Errorf("multi-kb search should report collection=multi_kb, got: %s", resp)
 	}
@@ -386,7 +447,7 @@ func TestSearchMultiKB_RealSearch(t *testing.T) {
 // from the body but resolveKB only looked at c.Query("kb_id"), silently
 // discarding the body value and routing all writes to the default KB.
 func TestAddDocument_BodyKBID(t *testing.T) {
-	r, kbSvc := setupIntegrationServer(t)
+	r, kbSvc, _ := setupIntegrationServer(t)
 
 	// Create two KBs
 	legacyKeyA := "legacy:public:body_kb_a"
@@ -457,7 +518,7 @@ func TestAddDocument_BodyKBID(t *testing.T) {
 // generation end-to-end. If the LLM is unavailable the test is skipped
 // rather than failed (the setup integration server falls back to nil).
 func TestChat_SingleKB(t *testing.T) {
-	r, kbSvc := setupIntegrationServer(t)
+	r, kbSvc, _ := setupIntegrationServer(t)
 
 	// Seed a KB with content
 	legacyKey := "legacy:public:chat_test"
@@ -545,7 +606,7 @@ func mcpCall(t *testing.T, r http.Handler, sessionID string, id int, tool, argsJ
 // TestMCP_RawMode_SingleKB verifies that MCP rag_ask in raw mode returns
 // relevant retrieved documents from a single KB.
 func TestMCP_RawMode_SingleKB(t *testing.T) {
-	r, kbSvc := setupIntegrationServer(t)
+	r, kbSvc, _ := setupIntegrationServer(t)
 
 	// Seed a KB
 	legacyKey := "legacy:public:mcp_raw"
@@ -604,7 +665,7 @@ func TestMCP_RawMode_SingleKB(t *testing.T) {
 // TestMCP_RawMode_MultiKB verifies that MCP rag_ask in raw mode aggregates
 // results from multiple KBs (via kb_ids array).
 func TestMCP_RawMode_MultiKB(t *testing.T) {
-	r, kbSvc := setupIntegrationServer(t)
+	r, kbSvc, esClient := setupIntegrationServer(t)
 
 	// Create two KBs
 	legacyKey1 := "legacy:public:mcp_multi_a"
@@ -636,6 +697,16 @@ func TestMCP_RawMode_MultiKB(t *testing.T) {
 	if wb.Code != 200 {
 		t.Fatalf("add to kbb: %d %s", wb.Code, wb.Body.String())
 	}
+
+	// ES near-real-time: force refresh so newly-indexed docs are searchable
+	if refreshResp, err := esClient.Indices.Refresh(esClient.Indices.Refresh.WithIndex("kb_*")); err != nil {
+		t.Logf("refresh warning: %v", err)
+	} else {
+		refreshResp.Body.Close()
+		t.Logf("refresh kb_*: status=%d", refreshResp.StatusCode)
+	}
+	// Also wait a brief moment for ES to complete the refresh
+	time.Sleep(200 * time.Millisecond)
 
 	sid := mcpInit(t, r)
 
@@ -688,13 +759,12 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
-// probeServices checks whether ES and Ollama embedding are reachable.
+// probeOllama checks whether Ollama embedding is reachable.
 // Returns a list of service names that are missing (empty = all good).
-func probeServices(t *testing.T, esURL, ollamaURL, ollamaModel string) []string {
+func probeOllama(t *testing.T, ollamaURL, ollamaModel string) []string {
 	t.Helper()
 	var missing []string
 
-	// ES: simple GET on root or _cluster/health
 	doHTTPProbe := func(label, url string) {
 		client := &http.Client{Timeout: 3 * time.Second}
 		resp, err := client.Get(url)
@@ -712,9 +782,7 @@ func probeServices(t *testing.T, esURL, ollamaURL, ollamaModel string) []string 
 		}
 	}
 
-	doHTTPProbe("elasticsearch", esURL)
-
-	// Ollama: GET /api/tags or /v1/models
+	// Ollama: GET /api/tags
 	doHTTPProbe("ollama ("+ollamaModel+")", strings.TrimSuffix(ollamaURL, "/v1")+"/api/tags")
 
 	return missing

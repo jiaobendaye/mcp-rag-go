@@ -5,7 +5,6 @@ package rag
 
 import (
 	"context"
-	"os"
 	"testing"
 
 	"github.com/elastic/go-elasticsearch/v8"
@@ -14,7 +13,7 @@ import (
 	elastic_retriever "github.com/cloudwego/eino-ext/components/retriever/es8"
 	elastic_search_mode "github.com/cloudwego/eino-ext/components/retriever/es8/search_mode"
 
-	"github.com/jiaobendaye/mcp-rag-go/internal/config"
+	"github.com/jiaobendaye/mcp-rag-go/internal/testutil"
 )
 
 const testDims = 4
@@ -22,13 +21,15 @@ const testDims = 4
 func setupIntegrationTest(t *testing.T) (*KBIndexer, *KBRetriever, func()) {
 	t.Helper()
 
-	cfg := config.DefaultConfig()
-	if url := os.Getenv("MCP_RAG_ES_URL"); url != "" {
-		cfg.ESUrl = url
+	ctx := context.Background()
+
+	esURL, err := testutil.GetESURL(ctx)
+	if err != nil {
+		t.Skipf("SKIP: cannot start ES container: %v", err)
 	}
 
 	esClient, err := elasticsearch.NewClient(elasticsearch.Config{
-		Addresses: []string{cfg.ESUrl},
+		Addresses: []string{esURL},
 	})
 	if err != nil {
 		t.Fatalf("create es client: %v", err)
@@ -102,25 +103,27 @@ func TestIntegrationIndexAndSearch(t *testing.T) {
 }
 
 func TestIntegrationSearchEmptyIndex(t *testing.T) {
-	cfg := config.DefaultConfig()
-	if url := os.Getenv("MCP_RAG_ES_URL"); url != "" {
-		cfg.ESUrl = url
+	ctx := context.Background()
+
+	esURL, err := testutil.GetESURL(ctx)
+	if err != nil {
+		t.Skipf("SKIP: cannot start ES container: %v", err)
 	}
 
 	esClient, err := elasticsearch.NewClient(elasticsearch.Config{
-		Addresses: []string{cfg.ESUrl},
+		Addresses: []string{esURL},
 	})
 	if err != nil {
 		t.Fatalf("create es client: %v", err)
 	}
 
 	indexName := "test_empty_integration"
-	ctx := context.Background()
 
 	indexer, err := NewKBIndexer(ctx, &elastic_indexer.IndexerConfig{
-		Client:    esClient,
-		Index:     indexName,
-		IndexSpec: indexSpecForTestDims(testDims),
+		Client:           esClient,
+		Index:            indexName,
+		IndexSpec:        indexSpecForTestDims(testDims),
+		DocumentToFields: ProjectDocumentToFields(),
 	})
 	if err != nil {
 		t.Fatalf("create indexer: %v", err)
@@ -132,10 +135,11 @@ func TestIntegrationSearchEmptyIndex(t *testing.T) {
 
 	// Empty index: confirm we can build a retriever without error
 	_, err = NewKBRetriever(ctx, &elastic_retriever.RetrieverConfig{
-		Client:     esClient,
-		Index:      indexName,
-		TopK:       5,
-		SearchMode: elastic_search_mode.SearchModeRawStringRequest(),
+		Client:       esClient,
+		Index:        indexName,
+		TopK:         5,
+		SearchMode:   elastic_search_mode.SearchModeRawStringRequest(),
+		ResultParser: ProjectResultParser(),
 	})
 	if err != nil {
 		t.Fatalf("create retriever on empty index: %v", err)
