@@ -48,6 +48,33 @@ run: build ## 前台运行(不后台,Ctrl-C 退出)
 	@set -a; . ./.env; set +a; ./$(BIN) serve --config $(CONFIG)
 
 # -----------------------------------------------------------------------------
+# Docker
+# -----------------------------------------------------------------------------
+
+DOCKER_IMAGE ?= mcp-rag
+DOCKER_TAG   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
+docker-build: ## 构建 Docker 镜像
+	docker build \
+		--build-arg VERSION=$(DOCKER_TAG) \
+		--build-arg COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown) \
+		-t $(DOCKER_IMAGE):$(DOCKER_TAG) \
+		-t $(DOCKER_IMAGE):latest \
+		.
+
+docker-run: docker-build ## 前台运行 Docker 容器(映射端口 8060)
+	docker run --rm -p 8060:8060 \
+		-e LANGFUSE_BASE_URL \
+		-e LANGFUSE_PUBLIC_KEY \
+		-e LANGFUSE_SECRET_KEY \
+		-e MCP_RAG_LLM_API_KEY \
+		$(DOCKER_IMAGE):latest
+
+docker-push: ## 推送 Docker 镜像到 ghcr.io
+	docker tag $(DOCKER_IMAGE):latest ghcr.io/jiaobendaye/$(DOCKER_IMAGE):$(DOCKER_TAG)
+	docker push ghcr.io/jiaobendaye/$(DOCKER_IMAGE):$(DOCKER_TAG)
+
+# -----------------------------------------------------------------------------
 # 服务生命周期
 # -----------------------------------------------------------------------------
 
@@ -137,3 +164,11 @@ clean-all: clean clean-state clean-es ## 清理构建 + 状态 + ES(完整重置
 reset: clean-all build serve ## 一键完整重置:清掉一切 → 重新构建 → 后台启动
 	@echo "---"
 	@make status
+
+# -----------------------------------------------------------------------------
+# Idempotency
+# -----------------------------------------------------------------------------
+
+idem-cleanup: ## 清理过期的幂等性缓存记录(24h TTL)
+	@curl -sS -XPOST "http://localhost:8060/admin/idempotency-cleanup" \
+		| head -c 500 ; echo

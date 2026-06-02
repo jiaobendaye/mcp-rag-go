@@ -262,3 +262,54 @@ func TestQuotaMiddleware(t *testing.T) {
 }
 
 
+
+func TestRequestIDMiddleware_GeneratesNewID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(RequestIDMiddleware())
+	r.GET("/test", func(c *gin.Context) {
+		rid := GetRequestID(c)
+		if rid == "" {
+			t.Error("expected non-empty request_id")
+		}
+		c.String(200, rid)
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+
+	if resp.Code != 200 {
+		t.Fatalf("expected 200, got %d", resp.Code)
+	}
+	rid := strings.TrimSpace(resp.Body.String())
+	if rid == "" {
+		t.Error("expected non-empty request_id in response body")
+	}
+	if resp.Header().Get("X-Request-Id") != rid {
+		t.Errorf("expected X-Request-Id header %q, got %q", rid, resp.Header().Get("X-Request-Id"))
+	}
+}
+
+func TestRequestIDMiddleware_PropagatesExistingID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(RequestIDMiddleware())
+	r.GET("/test", func(c *gin.Context) {
+		rid := GetRequestID(c)
+		c.String(200, rid)
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("X-Request-Id", "my-custom-id")
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, req)
+
+	rid := strings.TrimSpace(resp.Body.String())
+	if rid != "my-custom-id" {
+		t.Errorf("expected my-custom-id, got %s", rid)
+	}
+	if resp.Header().Get("X-Request-Id") != "my-custom-id" {
+		t.Errorf("expected X-Request-Id header my-custom-id, got %q", resp.Header().Get("X-Request-Id"))
+	}
+}

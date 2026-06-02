@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"time"
@@ -35,13 +35,13 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 	}
 
-	log.Printf("Mock AI server listening on %s", *addr)
-	log.Printf("  POST /v1/embeddings")
-	log.Printf("  POST /v1/chat/completions")
-	log.Printf("  GET  /v1/models")
-	log.Printf("  GET  /health")
+	slog.Info("Mock AI server listening", "addr", *addr)
+	slog.Info("  POST /v1/embeddings")
+	slog.Info("  POST /v1/chat/completions")
+	slog.Info("  GET  /v1/models")
+	slog.Info("  GET  /health")
 	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("server: %v", err)
+		slog.Error("server", "err", err)
 	}
 }
 
@@ -50,7 +50,7 @@ func withLogging(next http.Handler) http.Handler {
 		start := time.Now()
 		next.ServeHTTP(w, r)
 		if *verbose {
-			log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+			slog.Info("mock request", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start))
 		}
 	})
 }

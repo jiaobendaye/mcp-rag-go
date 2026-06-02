@@ -1,0 +1,50 @@
+# Development stack for mcp-rag.
+#
+# Usage:
+#   docker compose up -d              # ES only (default)
+#   docker compose --profile full up  # ES + mcp-rag
+#   docker compose down -v            # stop and remove volumes
+
+services:
+  elasticsearch:
+    image: docker.io/elasticsearch:8.16.1
+    container_name: mcp-rag-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE 'green|yellow'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mcp-rag:
+    image: mcp-rag:latest
+    container_name: mcp-rag
+    build:
+      context: .
+    ports:
+      - "8060:8060"
+    environment:
+      - MCP_RAG_ES_URL=http://elasticsearch:9200
+      - MCP_RAG_STATIC_DIR=/static
+      - MCP_RAG_KNOWLEDGE_BASE_DB_PATH=/data/knowledge_bases.sqlite3
+      - MCP_RAG_EMBEDDING_BASE_URL=http://mock-ai-server:11435/v1
+      - MCP_RAG_LLM_BASE_URL=http://mock-ai-server:11435/v1
+    volumes:
+      - mcp-rag-data:/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    profiles:
+      - full
+
+volumes:
+  es-data:
+  mcp-rag-data:

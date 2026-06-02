@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
+	lfcallbacks "github.com/cloudwego/eino-ext/callbacks/langfuse"
 	elastic_indexer "github.com/cloudwego/eino-ext/components/indexer/es8"
 	elastic_retriever "github.com/cloudwego/eino-ext/components/retriever/es8"
 	elastic_search_mode "github.com/cloudwego/eino-ext/components/retriever/es8/search_mode"
@@ -27,6 +28,13 @@ import (
 	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
 	"github.com/jiaobendaye/mcp-rag-go/internal/security"
 )
+
+// BuildInfo stores compile-time version metadata set via -ldflags.
+var BuildInfo = struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	BuiltAt string `json:"built_at"`
+}{"dev", "unknown", "unknown"}
 
 // Server holds all dependencies for HTTP handlers.
 type Server struct {
@@ -89,13 +97,18 @@ func New(
 // Setup registers all routes on the Gin engine.
 func (s *Server) Setup() *gin.Engine {
 	r := gin.New()
-	r.Use(gin.Logger(), gin.Recovery())
+	r.Use(RequestIDMiddleware(), SlogAccessLogger(), gin.Recovery())
 
 	// Request tracing middleware (must before SecurityMiddleware to set headers early)
 	r.Use(TracingMiddleware())
 
 	// Security middleware (auth + rate-limit, no-op when disabled)
 	r.Use(SecurityMiddleware(s.cfg))
+
+	// Idempotency middleware (write-API dedup via Idempotency-Key header)
+	if s.kbs != nil {
+		r.Use(IdempotencyRouteFilter(s.kbs.Store()))
+	}
 
 	// Root and legacy redirects
 	r.GET("/", func(c *gin.Context) { c.Redirect(http.StatusFound, "/app") })
@@ -137,6 +150,10 @@ func (s *Server) Setup() *gin.Engine {
 	r.GET("/knowledge-bases", s.listKnowledgeBases)
 	r.POST("/knowledge-bases", s.createKnowledgeBase)
 	r.GET("/collections", s.listCollections)
+
+	// Admin
+	r.POST("/admin/idempotency-cleanup", s.idempotencyCleanup)
+	r.GET("/version", s.version)
 
 	// Search & Chat
 	r.GET("/search", s.search)
@@ -775,6 +792,25 @@ func (s *Server) createKnowledgeBase(c *gin.Context) {
 	c.JSON(http.StatusOK, kb)
 }
 
+// idempotencyCleanup deletes expired idempotency cache entries.
+func (s *Server) idempotencyCleanup(c *gin.Context) {
+	if s.kbs == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": "knowledge base service not configured"})
+		return
+	}
+	n, err := s.kbs.Store().CleanupExpiredIdempotency()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": n})
+}
+
+// version returns the build version info.
+func (s *Server) version(c *gin.Context) {
+	c.JSON(http.StatusOK, BuildInfo)
+}
+
 // listCollections returns collection names for all accessible KBs.
 func (s *Server) listCollections(c *gin.Context) {
 	userID := parseIntPtr(c.Query("user_id"))
@@ -1370,7 +1406,10 @@ func (s *Server) chat(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
-	answer, err := chain.Invoke(c.Request.Context(), req.Query)
+	ctx := lfcallbacks.SetTrace(c.Request.Context(),
+		langfuseTraceOpts(req.Query, GetRequestID(c), req.UserID, req.AgentID)...,
+	)
+	answer, err := chain.Invoke(ctx, req.Query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -1420,7 +1459,10 @@ func (s *Server) chatMultiKB(c *gin.Context, req *rag.ChatRequest) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
 	}
-	answer, err := chain.Invoke(c.Request.Context(), req.Query)
+	ctx := lfcallbacks.SetTrace(c.Request.Context(),
+		langfuseTraceOpts(req.Query, GetRequestID(c), req.UserID, req.AgentID)...,
+	)
+	answer, err := chain.Invoke(ctx, req.Query)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -1432,6 +1474,37 @@ func (s *Server) chatMultiKB(c *gin.Context, req *rag.ChatRequest) {
 		"response":   answer,
 		"sources":    []any{},
 	})
+}
+
+// langfuseTraceOpts builds Langfuse SetTrace options from request metadata.
+// When no user/session info is available, the trace still carries the query input and tags.
+func langfuseTraceOpts(query string, requestID string, userID *int64, agentID *int64) []lfcallbacks.TraceOption {
+	tags := []string{"mcp-rag"}
+	if requestID != "" {
+		tags = append(tags, requestID)
+	}
+	opts := []lfcallbacks.TraceOption{
+		lfcallbacks.WithInput(query),
+		lfcallbacks.WithTags(tags...),
+	}
+	if userID != nil {
+		opts = append(opts, lfcallbacks.WithUserID(fmt.Sprintf("%d", *userID)))
+	}
+	if agentID != nil {
+		opts = append(opts, lfcallbacks.WithSessionID(fmt.Sprintf("agent_%d", *agentID)))
+	}
+	return opts
+}
+
+// requestIDFromContext extracts the request_id from slog attributes stored
+// in the context by RequestIDMiddleware. Returns "" if not found.
+func requestIDFromContext(ctx context.Context) string {
+	for _, attr := range SlogAttrsFromContext(ctx) {
+		if attr.Key == "request_id" {
+			return attr.Value.String()
+		}
+	}
+	return ""
 }
 
 // resolveKBFromChat resolves KB from ChatRequest fields.

@@ -11,6 +11,8 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
+	lfcallbacks "github.com/cloudwego/eino-ext/callbacks/langfuse"
+
 	"github.com/jiaobendaye/mcp-rag-go/internal/knowledgebase"
 	"github.com/jiaobendaye/mcp-rag-go/internal/rag"
 )
@@ -218,7 +220,11 @@ func (s *Server) handleSummaryMode(ctx context.Context, query string, limit int,
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
 	}
-	answer, err := chain.Invoke(ctx, query)
+	traceCtx := lfcallbacks.SetTrace(ctx,
+		lfcallbacks.WithInput(query),
+		lfcallbacks.WithTags("mcp-rag", requestIDFromContext(ctx)),
+	)
+	answer, err := chain.Invoke(traceCtx, query)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
 	}
@@ -371,7 +377,11 @@ func (s *Server) handleRagAskMultiKB(ctx context.Context, query string, mode str
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
 		}
-		answer, err := chain.Invoke(ctx, query)
+		traceCtx := lfcallbacks.SetTrace(ctx,
+			lfcallbacks.WithInput(query),
+			lfcallbacks.WithTags("mcp-rag", requestIDFromContext(ctx)),
+		)
+		answer, err := chain.Invoke(traceCtx, query)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("对话生成失败: %v", err)), nil
 		}

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/jiaobendaye/mcp-rag-go/internal/migrations"
 )
 
 // Store provides SQLite-backed knowledge base CRUD.
@@ -23,6 +25,9 @@ func NewStore(dbPath string) (*Store, error) {
 	}
 	s := &Store{db: db}
 	if err := s.initialize(); err != nil {
+		return nil, err
+	}
+	if err := migrations.Run(db); err != nil {
 		return nil, err
 	}
 	return s, nil

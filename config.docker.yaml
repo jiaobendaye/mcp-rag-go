@@ -1,0 +1,11 @@
+# Container-friendly config — overrides paths for distroless container.
+# Used by Dockerfile ENTRYPOINT: mcp-rag serve --config /etc/mcp-rag/config.yaml
+#
+# Local dev: use config.yaml
+# Container: this file is baked into the image
+
+http_port: 8060
+static_dir: "/static"
+knowledge_base_db_path: "/data/knowledge_bases.sqlite3"
+
+# The rest uses defaults or env var overrides (MCP_RAG_*)

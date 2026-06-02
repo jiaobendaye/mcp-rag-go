@@ -15,6 +15,7 @@ type Config struct {
 	// Server
 	HTTPPort  int    `yaml:"http_port"`  // HTTP server port, default 8060
 	StaticDir string `yaml:"static_dir"` // static files directory, default "./static"
+	LogLevel  string `yaml:"log_level"`  // "debug" | "info" | "warn" | "error", default "info"
 
 	// Elasticsearch
 	ESUrl    string `yaml:"es_url"`    // ES connection URL
@@ -66,6 +67,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		HTTPPort:          8060,
 		StaticDir:         "./static",
+		LogLevel:          "info",
 		ESUrl:             "http://localhost:9200",
 		KnowledgeBaseDBPath: "./data/knowledge_bases.sqlite3",
 		EmbeddingProvider: "openai",
@@ -116,6 +118,9 @@ func Load(configPath string) (*Config, error) {
 func applyEnvOverrides(cfg *Config) {
 	envMap := map[string]func(string){
 		"MCP_RAG_HTTP_PORT":            func(v string) { cfg.HTTPPort = parseInt(v, cfg.HTTPPort) },
+		"MCP_RAG_STATIC_DIR":           func(v string) { cfg.StaticDir = v },
+		"MCP_RAG_KNOWLEDGE_BASE_DB_PATH": func(v string) { cfg.KnowledgeBaseDBPath = v },
+		"MCP_RAG_LOG_LEVEL":            func(v string) { cfg.LogLevel = v },
 		"MCP_RAG_ES_URL":               func(v string) { cfg.ESUrl = v },
 		"MCP_RAG_EMBEDDING_PROVIDER":   func(v string) { cfg.EmbeddingProvider = v },
 		"MCP_RAG_EMBEDDING_MODEL":      func(v string) { cfg.EmbeddingModel = v },

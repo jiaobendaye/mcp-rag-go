@@ -4,7 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,6 +33,13 @@ import (
 
 var configPath string
 
+// Build-time variables set via -ldflags.
+var (
+	version = "dev"
+	commit  = "unknown"
+	builtAt = "unknown"
+)
+
 var rootCmd = &cobra.Command{
 	Use:   "mcp-rag",
 	Short: "MCP-RAG: RAG service with MCP protocol support",
@@ -44,9 +51,17 @@ var serveCmd = &cobra.Command{
 	RunE:  runServe,
 }
 
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print version information",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("mcp-rag %s (commit %s, built %s)\n", version, commit, builtAt)
+	},
+}
+
 func init() {
 	serveCmd.Flags().StringVarP(&configPath, "config", "c", "config.yaml", "path to config file")
-	rootCmd.AddCommand(serveCmd)
+	rootCmd.AddCommand(serveCmd, versionCmd)
 }
 
 func main() {
@@ -92,7 +107,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("create config manager: %w", err)
 	}
 	cfg := configManager.Get()
-	log.Printf("Starting MCP-RAG server on port %d", cfg.HTTPPort)
+	server.BuildInfo.Version = version
+	server.BuildInfo.Commit = commit
+	server.BuildInfo.BuiltAt = builtAt
+	slog.SetDefault(observability.NewLogger(cfg.LogLevel))
+	slog.Info("Starting MCP-RAG server", "port", cfg.HTTPPort)
 
 	// Observability
 	metricsCollector := observability.NewMetricsCollector(observability.DefaultMetricsConfig())
@@ -108,7 +127,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		})
 		callbacks.AppendGlobalHandlers(lfHandler)
 		langfuseFlusher = flusher
-		log.Printf("Langfuse tracing enabled: %s", lfHost)
+		slog.Info("Langfuse tracing enabled", "host", lfHost)
 	}
 
 	// Retrieval cache
@@ -134,7 +153,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("ensure default kb: %w", err)
 	}
-	log.Printf("Default KB: %s (%s)", defaultKB.Name, defaultKB.IndexName())
+	slog.Info("Default KB", "name", defaultKB.Name, "index", defaultKB.IndexName())
 
 	// eino-ext embedder (wrapped in SwappableEmbedder for future hot-swap)
 	rawEmbedder, err := openaiembed.NewEmbedder(ctx, &openaiembed.EmbeddingConfig{
@@ -152,7 +171,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("probe embedding: %w", err)
 	}
 	dims := len(vecs[0])
-	log.Printf("Embedding dims: %d", dims)
+	slog.Info("Embedding dims", "dims", dims)
 
 	// Wrap in swappable proxy for future hot-swap support
 	embedder := swappable.NewSwappableEmbedder(rawEmbedder)
@@ -198,15 +217,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
-		log.Println("Shutting down...")
+		slog.Info("Shutting down...")
 		if langfuseFlusher != nil {
-			log.Println("Flushing Langfuse events...")
+			slog.Info("Flushing Langfuse events...")
 			langfuseFlusher()
 		}
 		httpServer.Shutdown(context.Background())
 	}()
 
-	log.Printf("MCP-RAG listening on :%d", cfg.HTTPPort)
+	slog.Info("MCP-RAG listening", "port", cfg.HTTPPort)
 	return httpServer.ListenAndServe()
 }
 

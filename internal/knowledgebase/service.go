@@ -18,6 +18,11 @@ func NewService(dbPath string) (*Service, error) {
 	return &Service{store: store}, nil
 }
 
+// Store returns the underlying Store for operations like idempotency.
+func (s *Service) Store() *Store {
+	return s.store
+}
+
 // SetEmbeddingInfo records the current embedding model and dims for use
 // when creating new KBs and checking existing KB compatibility.
 func (s *Service) SetEmbeddingInfo(model string, dims int) {
