@@ -66,6 +66,11 @@ func (s *Service) ListAccessible(userID *int64) ([]*KnowledgeBase, error) {
 }
 
 // Resolve resolves request parameters to a specific knowledge base.
+//
+// Resolution order (aligns with Python):
+//  1. kb_id       → direct Get (with access control)
+//  2. collection  → GetByName lookup (auto-create if not found)
+//  3. scope       → default KB (existing behavior)
 func (s *Service) Resolve(req ResolveRequest) (*Resolution, error) {
 	// 1. Explicit kb_id
 	if req.KBID != nil {
@@ -76,10 +81,31 @@ func (s *Service) Resolve(req ResolveRequest) (*Resolution, error) {
 		if kb == nil {
 			return nil, &AccessError{KBID: *req.KBID, Msg: fmt.Sprintf("knowledge base %d not found", *req.KBID)}
 		}
+		if err := s.ensureAccess(kb, req.UserID); err != nil {
+			return nil, err
+		}
 		return &Resolution{KnowledgeBase: kb, SelectedVia: "kb_id"}, nil
 	}
 
-	// 2. Scope-based resolution
+	// 2. Collection name lookup within scope (aligns with Python collection parameter)
+	if req.Collection != nil && *req.Collection != "" && *req.Collection != "default" {
+		scope := normalizeScope(req.Scope, req.UserID, req.AgentID)
+		kb, err := s.store.GetByName(string(scope), req.UserID, req.AgentID, *req.Collection)
+		if err != nil {
+			return nil, err
+		}
+		if kb != nil {
+			return &Resolution{KnowledgeBase: kb, SelectedVia: "collection"}, nil
+		}
+		// Auto-create (like Python's ChromaDB auto-creating a collection)
+		kb, err = s.store.Create(*req.Collection, string(scope), req.UserID, req.AgentID)
+		if err != nil {
+			return nil, err
+		}
+		return &Resolution{KnowledgeBase: kb, SelectedVia: "collection"}, nil
+	}
+
+	// 3. Scope-based resolution (default KB)
 	scope := normalizeScope(req.Scope, req.UserID, req.AgentID)
 
 	if scope == ScopePublic {
@@ -115,6 +141,18 @@ func normalizeScope(scope *string, userID, agentID *int64) Scope {
 	default:
 		return ScopePublic
 	}
+}
+
+// ensureAccess checks that the caller (identified by userID) can access the KB.
+// Public KBs are accessible to everyone. Agent-private KBs require owner match.
+func (s *Service) ensureAccess(kb *KnowledgeBase, userID *int64) error {
+	if kb.Scope == ScopePublic {
+		return nil
+	}
+	if userID == nil || kb.OwnerUserID == nil || *kb.OwnerUserID != *userID {
+		return &AccessError{KBID: kb.ID, Msg: "access denied"}
+	}
+	return nil
 }
 
 func containsKB(kbs []*KnowledgeBase, id int64) bool {

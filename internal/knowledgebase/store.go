@@ -81,6 +81,17 @@ func (s *Store) GetAgentPrivateDefault(userID, agentID int64) (*KnowledgeBase, e
 	return scanKB(row)
 }
 
+// GetByName returns the first active KB matching the given scope + owner tuple + name.
+func (s *Store) GetByName(scope string, ownerUserID, ownerAgentID *int64, name string) (*KnowledgeBase, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	row := s.db.QueryRow(
+		"SELECT id, name, scope, owner_user_id, owner_agent_id, collection_name, status, created_at, updated_at FROM knowledge_bases WHERE scope=? AND name=? AND owner_user_id IS ? AND owner_agent_id IS ? AND status='active' ORDER BY id ASC LIMIT 1",
+		scope, name, ownerUserID, ownerAgentID,
+	)
+	return scanKB(row)
+}
+
 // ListAccessible returns knowledge bases accessible to the given user.
 func (s *Store) ListAccessible(userID *int64) ([]*KnowledgeBase, error) {
 	s.mu.RLock()

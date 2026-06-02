@@ -10,6 +10,7 @@ type ChatRequest struct {
 	Query               string  `json:"query"`
 	KBID                *int64  `json:"kb_id,omitempty"`
 	KBIDs               []int64 `json:"kb_ids,omitempty"`
+	Collection          string  `json:"collection,omitempty"`
 	Limit               int     `json:"limit,omitempty"`
 	UserID              *int64  `json:"user_id,omitempty"`
 	AgentID             *int64  `json:"agent_id,omitempty"`

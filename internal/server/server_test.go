@@ -189,20 +189,26 @@ func TestChatEndpoint(t *testing.T) {
 		}
 	})
 	t.Run("chat with extra fields", func(t *testing.T) {
-		body := `{"query":"test","collection":"default","kb_id":1,"limit":10,"user_id":1001,"agent_id":50}`
-		w := httptest.NewRecorder()
-		req, _ := http.NewRequest("POST", "/chat", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		r.ServeHTTP(w, req)
-		if w.Code != 200 {
-			t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
-		}
-		var resp map[string]any
-		json.NewDecoder(w.Body).Decode(&resp)
-		if resp["collection"] == nil || resp["collection"] == "" {
-			t.Error("expected collection in response")
-		}
-	})
+			r, svc := setupTestServerWithKB(t)
+			// Pre-create a KB so kb_id=1 exists
+			kb, err := svc.Create("test-kb", "public", nil, nil)
+			if err != nil {
+				t.Fatalf("create kb: %v", err)
+			}
+			body := `{"query":"test","collection":"default","kb_id":` + itoa(kb.ID) + `,"limit":10,"user_id":1001,"agent_id":50}`
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("POST", "/chat", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
+			if w.Code != 200 {
+				t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			var resp map[string]any
+			json.NewDecoder(w.Body).Decode(&resp)
+			if resp["collection"] == nil || resp["collection"] == "" {
+				t.Error("expected collection in response")
+			}
+		})
 }
 
 func TestConfigGetFlatFormat(t *testing.T) {

@@ -752,6 +752,132 @@ func i64toa(n int64) string {
 	return itoa(n)
 }
 
+// ---------------------------------------------------------------------------
+// Collection resolution + access control integration tests
+// ---------------------------------------------------------------------------
+
+// TestIntegrationCollectionResolution verifies that ?collection=xxx with
+// user_id/agent_id creates and resolves KBs by name.
+func TestIntegrationCollectionResolution(t *testing.T) {
+	r, kbSvc, esClient := setupIntegrationServer(t)
+
+	uid := int64(1001)
+	aid := int64(2001)
+
+	// Add a document using collection name (auto-creates KB for user/agent)
+	// Note: do NOT send kb_id in body — let the URL collection parameter resolve the KB.
+	addBody := `{"content":"Elasticsearch是一个分布式搜索引擎。"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("/add-document?collection=my_collection&user_id=%d&agent_id=%d", uid, aid),
+		strings.NewReader(addBody))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("add-document with collection: %d %s", w.Code, w.Body.String())
+	}
+
+	// Verify a KB was created with the expected name and scope
+	kbs, err := kbSvc.ListAccessible(&uid)
+	if err != nil {
+		t.Fatalf("list accessible: %v", err)
+	}
+	found := false
+	for _, kb := range kbs {
+		if kb.Name == "my_collection" && kb.Scope == knowledgebase.ScopeAgentPrivate {
+			found = true
+			t.Logf("found KB: id=%d name=%s scope=%s collection_name=%s", kb.ID, kb.Name, kb.Scope, kb.CollectionName)
+			break
+		}
+	}
+	if !found {
+		t.Error("expected agent_private KB with name 'my_collection'")
+	}
+
+	// ES refresh for near-real-time
+	if refreshResp, err := esClient.Indices.Refresh(esClient.Indices.Refresh.WithIndex("kb_*")); err != nil {
+		t.Logf("refresh warning: %v", err)
+	} else {
+		refreshResp.Body.Close()
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Search using the same collection name — should find the content
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("GET",
+		fmt.Sprintf("/search?query=Elasticsearch&collection=my_collection&user_id=%d&agent_id=%d&limit=3", uid, aid),
+		nil)
+	r.ServeHTTP(w2, req2)
+	if w2.Code != 200 {
+		t.Fatalf("search with collection: %d %s", w2.Code, w2.Body.String())
+	}
+	if !strings.Contains(w2.Body.String(), "Elasticsearch") {
+		t.Errorf("search should contain Elasticsearch content, got: %s", w2.Body.String())
+	}
+	t.Logf("collection search OK: %s", w2.Body.String()[:min(len(w2.Body.String()), 200)])
+}
+
+// TestIntegrationAccessControl verifies that agent_private KBs are protected
+// from unauthorized access via kb_id.
+func TestIntegrationAccessControl(t *testing.T) {
+	r, kbSvc, esClient := setupIntegrationServer(t)
+
+	ownerUID := int64(100)
+	otherUID := int64(999)
+
+	// Create a private KB owned by ownerUID
+	privateKB, err := kbSvc.Create("私人知识库", "agent_private", &ownerUID, nil)
+	if err != nil {
+		t.Fatalf("create private KB: %v", err)
+	}
+
+	// Add a document to create the ES index (lazy creation)
+	// Must pass user_id as query param so ensureAccess allows the write.
+	addBody := fmt.Sprintf(`{"content":"这是私人知识库的内容。","kb_id":%d}`, privateKB.ID)
+	wa := httptest.NewRecorder()
+	ra, _ := http.NewRequest("POST",
+		fmt.Sprintf("/add-document?user_id=%d", ownerUID),
+		strings.NewReader(addBody))
+	ra.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(wa, ra)
+	if wa.Code != 200 {
+		t.Fatalf("add-document to private KB: %d %s", wa.Code, wa.Body.String())
+	}
+
+	// ES refresh for near-real-time
+	if refreshResp, err := esClient.Indices.Refresh(esClient.Indices.Refresh.WithIndex("kb_*")); err != nil {
+		t.Logf("refresh warning: %v", err)
+	} else {
+		refreshResp.Body.Close()
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Owner can access via kb_id
+	w1 := httptest.NewRecorder()
+	req1, _ := http.NewRequest("GET",
+		fmt.Sprintf("/search?query=私人&kb_id=%d&user_id=%d", privateKB.ID, ownerUID),
+		nil)
+	r.ServeHTTP(w1, req1)
+	if w1.Code != 200 {
+		t.Errorf("owner should be able to access: got %d body=%s", w1.Code, w1.Body.String())
+	}
+	t.Logf("owner search: code=%d", w1.Code)
+
+	// Non-owner cannot access via kb_id (denied at KB resolution, before ES)
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest("GET",
+		fmt.Sprintf("/search?query=私人&kb_id=%d&user_id=%d", privateKB.ID, otherUID),
+		nil)
+	r.ServeHTTP(w2, req2)
+	if w2.Code == 200 {
+		t.Errorf("non-owner should NOT be able to access private KB")
+	}
+	if !strings.Contains(w2.Body.String(), "access denied") {
+		t.Errorf("expected 'access denied', got: %s", w2.Body.String())
+	}
+	t.Logf("non-owner access denied: code=%d body=%s", w2.Code, w2.Body.String())
+}
+
 func firstNonEmpty(a, b string) string {
 	if a != "" {
 		return a

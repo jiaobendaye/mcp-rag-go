@@ -10,6 +10,23 @@ import (
 	"github.com/jiaobendaye/mcp-rag-go/internal/security"
 )
 
+// deriveTenantKey generates a tenant key from request parameters.
+// Format: u{user_id}_a{agent_id}_{collection}
+// Aligns with Python TenantContext.canonical_key().
+func deriveTenantKey(c *gin.Context) string {
+	userID := c.Query("user_id")
+	agentID := c.Query("agent_id")
+	collection := c.DefaultQuery("collection", "default")
+
+	if userID == "" {
+		return collection
+	}
+	if agentID == "" {
+		return fmt.Sprintf("u%s_%s", userID, collection)
+	}
+	return fmt.Sprintf("u%s_a%s_%s", userID, agentID, collection)
+}
+
 // SecurityMiddleware creates Gin middleware for auth and rate limiting.
 func SecurityMiddleware(cfg *config.Config) gin.HandlerFunc {
 	auth := security.NewSecurityPolicy(
@@ -28,8 +45,16 @@ func SecurityMiddleware(cfg *config.Config) gin.HandlerFunc {
 		// Extract API key from headers or query params
 		apiKey := extractAPIKey(c)
 
+		// Derive tenant key from request parameters (was clientIP)
+		tenantKey := deriveTenantKey(c)
+
+		// Populate RequestContext.Tenant (was always empty)
+		if rc := GetRequestContext(c); rc != nil {
+			rc.Tenant = tenantKey
+		}
+
 		// Auth check
-		decision := auth.Validate(apiKey, c.ClientIP())
+		decision := auth.Validate(apiKey, tenantKey)
 		if !decision.Allowed {
 			if decision.Reason == "api key required" {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"detail": decision.Reason})
@@ -39,8 +64,12 @@ func SecurityMiddleware(cfg *config.Config) gin.HandlerFunc {
 			return
 		}
 
-		// Rate limit check
-		rlDecision := limiter.Allow(c.ClientIP())
+		// Rate limit check (use tenant key as subject; fallback to clientIP when disabled)
+		rateLimitSubject := tenantKey
+		if tenantKey == "default" {
+			rateLimitSubject = c.ClientIP()
+		}
+		rlDecision := limiter.Allow(rateLimitSubject)
 		if !rlDecision.Allowed {
 			c.Header("Retry-After", fmt.Sprintf("%.0f", rlDecision.RetryAfterSeconds))
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"detail": "rate limit exceeded"})

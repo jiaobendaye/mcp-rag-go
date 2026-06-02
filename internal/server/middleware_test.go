@@ -12,6 +12,56 @@ import (
 	"github.com/jiaobendaye/mcp-rag-go/internal/config"
 )
 
+func TestDeriveTenantKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name       string
+		query      string
+		wantTenant string
+	}{
+		{
+			name:       "full params",
+			query:      "user_id=123&agent_id=456&collection=mykb",
+			wantTenant: "u123_a456_mykb",
+		},
+		{
+			name:       "no agent_id",
+			query:      "user_id=123&collection=mykb",
+			wantTenant: "u123_mykb",
+		},
+		{
+			name:       "only collection",
+			query:      "collection=mykb",
+			wantTenant: "mykb",
+		},
+		{
+			name:       "no params defaults to default",
+			query:      "",
+			wantTenant: "default",
+		},
+		{
+			name:       "only user_id",
+			query:      "user_id=123",
+			wantTenant: "u123_default",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", "/health?"+tt.query, nil)
+			c, _ := gin.CreateTestContext(w)
+			c.Request = req
+
+			got := deriveTenantKey(c)
+			if got != tt.wantTenant {
+				t.Errorf("deriveTenantKey = %q, want %q", got, tt.wantTenant)
+			}
+		})
+	}
+}
+
 func setupSecureServer(securityCfg *config.Config) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 

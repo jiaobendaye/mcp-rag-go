@@ -40,8 +40,9 @@ func (e *AccessError) Error() string { return e.Msg }
 
 // ResolveRequest contains parameters for resolving a knowledge base.
 type ResolveRequest struct {
-	KBID    *int64
-	Scope   *string
-	UserID  *int64
-	AgentID *int64
+	KBID       *int64
+	Collection *string // KB name (aligns with Python collection parameter)
+	Scope      *string
+	UserID     *int64
+	AgentID    *int64
 }

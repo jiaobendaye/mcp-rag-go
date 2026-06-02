@@ -31,6 +31,9 @@ func (s *Server) InitMCP() (*mcpserver.MCPServer, *mcpserver.StreamableHTTPServe
 		mcp.WithString("mode",
 			mcp.Description("模式: raw (仅检索) 或 summary (检索+LLM总结)，默认raw"),
 		),
+		mcp.WithString("collection",
+			mcp.Description("知识库名称（对齐Python collection参数）"),
+		),
 		mcp.WithInteger("kb_id",
 			mcp.Description("知识库ID"),
 		),
@@ -110,7 +113,7 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 	}
 
 	// Resolve KB
-	_, indexName, err := s.resolveMCPKB(kbID, scope, userID, agentID)
+	_, indexName, err := s.resolveMCPKB(kbID, scope, userID, agentID, request.GetString("collection", ""))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("知识库解析失败: %v", err)), nil
 	}
@@ -124,11 +127,16 @@ func (s *Server) handleRagAsk(ctx context.Context, request mcp.CallToolRequest) 
 }
 
 // resolveMCPKB resolves KB from MCP parameters.
-func (s *Server) resolveMCPKB(kbID int, scope string, userID, agentID int) (*knowledgebase.Resolution, string, error) {
+func (s *Server) resolveMCPKB(kbID int, scope string, userID, agentID int, collection string) (*knowledgebase.Resolution, string, error) {
 	var kbIDPtr *int64
 	if kbID > 0 {
 		id := int64(kbID)
 		kbIDPtr = &id
+	}
+
+	var collectionPtr *string
+	if collection != "" {
+		collectionPtr = &collection
 	}
 
 	var scopePtr *string
@@ -149,10 +157,11 @@ func (s *Server) resolveMCPKB(kbID int, scope string, userID, agentID int) (*kno
 	}
 
 	resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{
-		KBID:    kbIDPtr,
-		Scope:   scopePtr,
-		UserID:  userIDPtr,
-		AgentID: agentIDPtr,
+		KBID:       kbIDPtr,
+		Collection: collectionPtr,
+		Scope:      scopePtr,
+		UserID:     userIDPtr,
+		AgentID:    agentIDPtr,
 	})
 	if err != nil {
 		return nil, "", err

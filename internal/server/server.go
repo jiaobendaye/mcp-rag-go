@@ -188,12 +188,13 @@ func (s *Server) resolveKB(c *gin.Context, bodyKBID *int64) (*knowledgebase.Reso
 	if kbID == nil {
 		kbID = parseIntPtr(c.Query("kb_id"))
 	}
+	collection := strPtr(c.Query("collection"))
 	scope := strPtr(c.Query("scope"))
 	userID := parseIntPtr(c.Query("user_id"))
 	agentID := parseIntPtr(c.Query("agent_id"))
 
 	resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{
-		KBID: kbID, Scope: scope, UserID: userID, AgentID: agentID,
+		KBID: kbID, Collection: collection, Scope: scope, UserID: userID, AgentID: agentID,
 	})
 	if err != nil {
 		return nil, "", err
@@ -778,7 +779,11 @@ func (s *Server) createKnowledgeBase(c *gin.Context) {
 		return
 	}
 	if req.Scope == "" {
-		req.Scope = "public"
+		if req.OwnerUserID != nil && req.OwnerAgentID != nil {
+			req.Scope = "agent_private"
+		} else {
+			req.Scope = "public"
+		}
 	}
 
 	// Create new KB
@@ -1442,11 +1447,17 @@ func (s *Server) resolveKBFromChat(req *rag.ChatRequest) (*knowledgebase.Resolut
 		scopePtr = &scope
 	}
 
+	var collectionPtr *string
+	if req.Collection != "" {
+		collectionPtr = &req.Collection
+	}
+
 	resolution, err := s.kbs.Resolve(knowledgebase.ResolveRequest{
-		KBID:    req.KBID,
-		Scope:   scopePtr,
-		UserID:  req.UserID,
-		AgentID: req.AgentID,
+		KBID:       req.KBID,
+		Collection: collectionPtr,
+		Scope:      scopePtr,
+		UserID:     req.UserID,
+		AgentID:    req.AgentID,
 	})
 	if err != nil {
 		return nil, "", err
