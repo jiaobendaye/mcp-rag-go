@@ -14,8 +14,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/cobra"
 
+	"github.com/cloudwego/eino/callbacks"
 	"github.com/cloudwego/eino/components/document"
 
+	lfcallbacks "github.com/cloudwego/eino-ext/callbacks/langfuse"
 	elastic_indexer "github.com/cloudwego/eino-ext/components/indexer/es8"
 	openaiembed "github.com/cloudwego/eino-ext/components/embedding/openai"
 	openaimodel "github.com/cloudwego/eino-ext/components/model/openai"
@@ -94,6 +96,20 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	// Observability
 	metricsCollector := observability.NewMetricsCollector(observability.DefaultMetricsConfig())
+
+	// Langfuse tracing (via eino callbacks)
+	var langfuseFlusher func()
+	if lfHost := os.Getenv("LANGFUSE_BASE_URL"); lfHost != "" {
+		lfHandler, flusher := lfcallbacks.NewLangfuseHandler(&lfcallbacks.Config{
+			Host:      lfHost,
+			PublicKey: os.Getenv("LANGFUSE_PUBLIC_KEY"),
+			SecretKey: os.Getenv("LANGFUSE_SECRET_KEY"),
+			Name:      "mcp-rag",
+		})
+		callbacks.AppendGlobalHandlers(lfHandler)
+		langfuseFlusher = flusher
+		log.Printf("Langfuse tracing enabled: %s", lfHost)
+	}
 
 	// Retrieval cache
 	retrievalCache := rag.NewRetrievalCache()
@@ -183,6 +199,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Println("Shutting down...")
+		if langfuseFlusher != nil {
+			log.Println("Flushing Langfuse events...")
+			langfuseFlusher()
+		}
 		httpServer.Shutdown(context.Background())
 	}()
 
